@@ -1,0 +1,29 @@
+/.venv/
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local outputs
+*.cube
+*.dmg
+*.exe
+*.app/
+*.pkg
+
+# Local sample/test media
+LEICA-SL3.tif
+LUMIX-S1II.tif
+
+# Temporary files
+/tmp/
+tmp/

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Camera Match Lab</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ===================== HEADER ===================== -->
+  <header class="app-header">
+    <div class="logo">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <rect width="28" height="28" rx="7" fill="url(#g1)"/>
+        <path d="M7 14 Q14 7 21 14 Q14 21 7 14Z" fill="white" opacity="0.9"/>
+        <circle cx="14" cy="14" r="3" fill="url(#g1)"/>
+        <defs>
+          <linearGradient id="g1" x1="0" y1="0" x2="28" y2="28">
+            <stop offset="0%" stop-color="#c8a96e"/>
+            <stop offset="100%" stop-color="#8b5e3c"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <span class="logo-text">Camera Match <span class="logo-accent">Lab</span></span>
+    </div>
+
+    <!-- Step indicator -->
+    <nav class="step-nav" id="stepNav">
+      <div class="step-dot active" data-step="1" title="Modus">1</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step="2" title="Bilder laden">2</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step="3" title="Log-Profile">3</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step="4" title="Ecken markieren">4</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step="5" title="Patches feinjustieren">5</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step="6" title="LUT generieren">6</div>
+    </nav>
+
+    <div class="header-spacer"></div>
+  </header>
+
+  <!-- ===================== MAIN ===================== -->
+  <main class="app-main">
+
+    <!-- ── STEP 1: MODE ── -->
+    <section class="step-panel active" id="step-1">
+      <div class="step-header">
+        <h1 class="step-title">Welchen Modus möchtest du verwenden?</h1>
+        <p class="step-sub">Wähle Single für ein Bildpaar oder Master für mehrere Lichtsituationen.</p>
+      </div>
+      <div class="mode-cards">
+        <button class="mode-card" id="btnSingle" onclick="App.selectMode('single')">
+          <div class="mode-icon">
+            <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+              <rect x="8" y="10" width="24" height="20" rx="3" stroke="currentColor" stroke-width="2"/>
+              <circle cx="20" cy="20" r="5" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </div>
+          <h2>SINGLE LUT</h2>
+          <p>Ein Bildpaar &rarr; eine präzise LUT.<br/>Ideal für einen einzigen Schwenk oder Shot.</p>
+          <div class="mode-badge">Einfach</div>
+        </button>
+        <button class="mode-card" id="btnMaster" onclick="App.selectMode('master')">
+          <div class="mode-icon">
+            <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+              <rect x="4" y="14" width="20" height="16" rx="3" stroke="currentColor" stroke-width="2" opacity="0.5"/>
+              <rect x="10" y="10" width="20" height="16" rx="3" stroke="currentColor" stroke-width="2" opacity="0.75"/>
+              <rect x="16" y="6" width="20" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+              <circle cx="26" cy="14" r="4" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </div>
+          <h2>MASTER LUT</h2>
+          <p>Mehrere Bildpaare verschmelzen &rarr;<br/>universelle LUT für alle Lichtsituationen.</p>
+          <div class="mode-badge accent">Profimodus</div>
+        </button>
+      </div>
+    </section>
+
+    <!-- ── STEP 2: IMAGES ── -->
+    <section class="step-panel" id="step-2">
+      <div class="step-header">
+        <h1 class="step-title">Bilder laden</h1>
+        <p class="step-sub">Ziehe die Bilder per Drag &amp; Drop oder klicke zum Auswählen. Unterstützte Formate: <code>.tif .tiff .jpg .jpeg .png</code></p>
+      </div>
+
+      <div class="image-slots" id="imageSlots">
+        <!-- Slots injected by JS -->
+      </div>
+
+      <div id="masterAddBtn" class="master-add-wrap hidden">
+        <button class="btn-secondary" onclick="App.addMasterPair()">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Weiteres Szenenpaar hinzufügen
+        </button>
+      </div>
+
+      <div class="step-actions">
+        <button class="btn-ghost" onclick="App.goStep(1)">← Zurück</button>
+        <button class="btn-primary" id="step2Next" onclick="App.step2Next()" disabled>Weiter →</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 3: LOG PROFILES ── -->
+    <section class="step-panel" id="step-3">
+      <div class="step-header">
+        <h1 class="step-title">Kamera Log-Profile</h1>
+        <p class="step-sub">Wähle das Log-Profil für Quelle und Ziel.</p>
+      </div>
+
+      <div class="log-select-grid">
+        <div class="log-select-card">
+          <div class="log-label source-label">
+            <span class="log-dot source"></span> QUELL-Kamera (Source)
+          </div>
+          <p class="log-hint" id="sourceHint">z.B. Leica L-Log</p>
+          <input type="text" class="search-input" id="sourceSearch" placeholder="Suche... z.B. L-Log" oninput="App.filterLog('source', this.value)" autocomplete="off"/>
+          <div class="log-list-wrap">
+            <ul class="log-list" id="sourceList"></ul>
+          </div>
+          <div class="log-selected" id="sourceSelected">Kein Profil gewählt</div>
+        </div>
+
+        <div class="log-select-card">
+          <div class="log-label target-label">
+            <span class="log-dot target"></span> ZIEL-Kamera (Target)
+          </div>
+          <p class="log-hint" id="targetHint">z.B. Lumix V-Log</p>
+          <input type="text" class="search-input" id="targetSearch" placeholder="Suche... z.B. V-Log" oninput="App.filterLog('target', this.value)" autocomplete="off"/>
+          <div class="log-list-wrap">
+            <ul class="log-list" id="targetList"></ul>
+          </div>
+          <div class="log-selected" id="targetSelected">Kein Profil gewählt</div>
+        </div>
+      </div>
+
+      <div class="step-actions">
+        <button class="btn-ghost" onclick="App.goStep(2)">← Zurück</button>
+        <button class="btn-primary" id="step3Next" onclick="App.step3Next()" disabled>Weiter →</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 4: CORNER MARKING ── -->
+    <section class="step-panel" id="step-4">
+      <div class="step-header">
+        <h1 class="step-title" id="step4Title">Ecken markieren</h1>
+        <p class="step-sub">Klicke auf die <strong>4 äußersten Ecken</strong> des ColorCheckers. Reihenfolge: Oben-Links → Oben-Rechts → Unten-Rechts → Unten-Links.</p>
+      </div>
+
+      <div class="corner-ui">
+        <div class="corner-progress-row">
+          <div class="corner-dots" id="cornerDots">
+            <div class="cdot" id="cdot0"><span>TL</span></div>
+            <div class="cdot" id="cdot1"><span>TR</span></div>
+            <div class="cdot" id="cdot2"><span>BR</span></div>
+            <div class="cdot" id="cdot3"><span>BL</span></div>
+          </div>
+          <button class="btn-ghost small" onclick="App.resetCorners()">Zurücksetzen</button>
+        </div>
+
+        <div class="canvas-wrap" id="cornerCanvasWrap">
+          <img id="cornerImg" src="" alt="" draggable="false"/>
+          <canvas id="cornerCanvas"></canvas>
+        </div>
+      </div>
+
+      <div class="step-actions">
+        <button class="btn-ghost" onclick="App.cornerBack()">← Zurück</button>
+        <button class="btn-primary" id="step4Next" onclick="App.step4Next()" disabled>Ecken bestätigen →</button>
+      </div>
+    </section>
+
+    <!-- ── STEP 5: PATCH TUNING ── -->
+    <section class="step-panel" id="step-5">
+      <div class="step-header">
+        <h1 class="step-title" id="step5Title">Patch-Zentren feinjustieren</h1>
+        <p class="step-sub"><strong>Ziehe</strong> die roten Quadrate so, dass jedes Quadrat genau mittig auf einem Farbfeld sitzt.</p>
+      </div>
+
+      <div class="patch-ui">
+        <div class="patch-controls">
+          <button class="btn-ghost small" onclick="App.resetPatches()">Alle zurücksetzen</button>
+          <span class="patch-hint">Drag &amp; Drop zum Feintuning</span>
+        </div>
+        <div class="canvas-wrap" id="patchCanvasWrap">
+          <img id="patchImg" src="" alt="" draggable="false"/>
+          <canvas id="patchCanvas"></canvas>
+        </div>
+      </div>
+
+      <div class="step-actions">
+        <button class="btn-ghost" onclick="App.patchBack()">← Zurück</button>
+        <button class="btn-primary" id="step5Next" onclick="App.step5Next()">
+          <span id="step5NextLabel">Patches bestätigen →</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ── STEP 6: GENERATE / RESULT ── -->
+    <section class="step-panel" id="step-6">
+      <div class="step-header">
+        <h1 class="step-title" id="step6Title">LUT generieren</h1>
+      </div>
+
+      <div class="result-ui" id="resultUi">
+        <!-- Generating state -->
+        <div class="result-state" id="stateGenerating">
+          <div class="spinner-ring"></div>
+          <p class="result-label">Berechne Matrix &amp; baue 65³ LUT...</p>
+          <p class="result-sub">Das kann einige Sekunden dauern.</p>
+        </div>
+
+        <!-- Success state -->
+        <div class="result-state hidden" id="stateSuccess">
+          <div class="success-icon">
+            <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+              <circle cx="32" cy="32" r="30" stroke="url(#sg)" stroke-width="3"/>
+              <path d="M20 32l8 8 16-16" stroke="url(#sg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="sg" x1="0" y1="0" x2="64" y2="64">
+                  <stop offset="0%" stop-color="#c8a96e"/>
+                  <stop offset="100%" stop-color="#e8c98a"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <h2 class="result-success-title">LUT erfolgreich erstellt!</h2>
+          <div class="result-meta" id="resultMeta"></div>
+          <div class="result-actions">
+            <button id="btnSaveLut" class="btn-primary" onclick="App.saveLut()">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 11v2a1 1 0 01-1 1H4a1 1 0 01-1-1v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M8 2v7M5 6l3 4 3-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Speichern unter…
+            </button>
+            <button id="btnOpenFolder" class="btn-ghost hidden" onclick="App.openFolder(this.dataset.folder)">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 4a1 1 0 011-1h3l2 2h5a1 1 0 011 1v6a1 1 0 01-1 1H3a1 1 0 01-1-1V4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+              Ordner öffnen
+            </button>
+            <button class="btn-ghost" id="addSceneBtn" onclick="App.addAnotherScene()" style="display:none">
+              Weiteres Szenenpaar hinzufügen (Master)
+            </button>
+            <button class="btn-ghost" onclick="App.restart()">Neu starten</button>
+          </div>
+        </div>
+
+        <!-- Error state -->
+        <div class="result-state hidden" id="stateError">
+          <div class="error-icon">⚠</div>
+          <h2 class="result-error-title">Fehler</h2>
+          <p class="result-error-msg" id="errorMsg"></p>
+          <button class="btn-ghost" onclick="App.goStep(5)">← Zurück</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
