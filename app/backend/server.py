@@ -7,6 +7,9 @@ import base64
 import json
 import tempfile
 import uuid
+import time
+import shutil
+import atexit
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
@@ -17,9 +20,16 @@ from .lut_engine import (
     warp_image,
     extract_patches,
     get_log_profiles,
+    get_display_gammas,
     build_lut,
+    build_display_lut,
 )
 import numpy as np
+
+
+# Persistent cache directory for LUT outputs (avoids errno 30 on system tempdir cleanup)
+OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Camera Match Lab", "luts")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +44,36 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
     app = Flask(__name__, static_folder=frontend_dir, static_url_path="")
 
+    # Create a dedicated temp directory for this run that gets cleaned up on exit
+    INSTANCE_TEMP_DIR = tempfile.mkdtemp(prefix="clm_session_")
+
+    def cleanup_on_exit():
+        try:
+            shutil.rmtree(INSTANCE_TEMP_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+    atexit.register(cleanup_on_exit)
+
     # Temp storage for uploaded images and session data
     SESSIONS: dict = {}
+    SESSION_TIMEOUT = 1800  # 30 minutes
+
+    def cleanup_old_sessions():
+        now = time.time()
+        expired = []
+        for sid, data in SESSIONS.items():
+            if now - data.get("timestamp", now) > SESSION_TIMEOUT:
+                expired.append(sid)
+        
+        for sid in expired:
+            data = SESSIONS.pop(sid, {})
+            path = data.get("path") or data.get("warped_path")
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Serve frontend
@@ -53,12 +91,17 @@ def create_app(frontend_dir: str | None = None) -> Flask:
     def api_log_profiles():
         return jsonify(get_log_profiles())
 
+    @app.get("/api/display-gammas")
+    def api_display_gammas():
+        return jsonify(get_display_gammas())
+
     # ------------------------------------------------------------------
     # API: Upload image
     # ------------------------------------------------------------------
 
     @app.post("/api/upload")
     def api_upload():
+        cleanup_old_sessions()
         if "file" not in request.files:
             return jsonify({"error": "No file provided"}), 400
 
@@ -68,9 +111,8 @@ def create_app(frontend_dir: str | None = None) -> Flask:
             return jsonify({"error": f"Unsupported file type: {ext}"}), 400
 
         # Save to temp file
-        tmp_dir = tempfile.gettempdir()
         img_id = str(uuid.uuid4())
-        save_path = os.path.join(tmp_dir, f"clm_{img_id}{ext}")
+        save_path = os.path.join(INSTANCE_TEMP_DIR, f"clm_{img_id}{ext}")
         f.save(save_path)
 
         # Load and create preview
@@ -99,6 +141,7 @@ def create_app(frontend_dir: str | None = None) -> Flask:
             "path": save_path,
             "orig_shape": (orig_h, orig_w),
             "preview_scale": preview_scale,
+            "timestamp": time.time(),
         }
 
         return jsonify({
@@ -115,12 +158,14 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
     @app.post("/api/warp")
     def api_warp():
+        cleanup_old_sessions()
         data = request.get_json(force=True)
         img_id = data.get("img_id")
         corners = data.get("corners")  # [[x,y]*4]
 
         if img_id not in SESSIONS:
             return jsonify({"error": "Unknown image ID"}), 404
+        SESSIONS[img_id]["timestamp"] = time.time()
         if not corners or len(corners) != 4:
             return jsonify({"error": "Need exactly 4 corners"}), 400
 
@@ -140,9 +185,12 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
         # Store warped data for patch extraction later
         warped_id = str(uuid.uuid4())
-        warped_path = os.path.join(tempfile.gettempdir(), f"clm_warped_{warped_id}.npy")
+        warped_path = os.path.join(INSTANCE_TEMP_DIR, f"clm_warped_{warped_id}.npy")
         np.save(warped_path, warped_float)
-        SESSIONS[warped_id] = {"warped_path": warped_path}
+        SESSIONS[warped_id] = {
+            "warped_path": warped_path,
+            "timestamp": time.time()
+        }
 
         preview_bytes = image_to_jpeg_bytes(warped_display, quality=85)
         preview_b64 = base64.b64encode(preview_bytes).decode()
@@ -161,13 +209,14 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
     @app.post("/api/generate-lut")
     def api_generate_lut():
+        cleanup_old_sessions()
         data = request.get_json(force=True)
 
         pairs = data.get("pairs", [])          # [{source_warped_id, target_warped_id, source_patches, target_patches}]
         source_log = data.get("source_log")
         target_log = data.get("target_log")
         lut_name = data.get("lut_name", "CameraMatch")
-        mode = data.get("mode", "single")       # "single" | "master"
+        mode = data.get("mode", "single")       # "single" | "master" | "reference"
 
         if not pairs or not source_log or not target_log:
             return jsonify({"error": "Missing required parameters"}), 400
@@ -183,6 +232,9 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
             if src_warped_id not in SESSIONS or tgt_warped_id not in SESSIONS:
                 return jsonify({"error": "Unknown warped image ID"}), 404
+            
+            SESSIONS[src_warped_id]["timestamp"] = time.time()
+            SESSIONS[tgt_warped_id]["timestamp"] = time.time()
 
             src_warped = np.load(SESSIONS[src_warped_id]["warped_path"])
             tgt_warped = np.load(SESSIONS[tgt_warped_id]["warped_path"])
@@ -196,22 +248,29 @@ def create_app(frontend_dir: str | None = None) -> Flask:
         all_source_colors = np.vstack(all_source_colors)
         all_target_colors = np.vstack(all_target_colors)
 
-        # Output path: temp dir, user downloads via /api/download
-        out_dir = tempfile.gettempdir()
-        out_filename = _unique_filename(out_dir, lut_name, "cube")
-        out_path = os.path.join(out_dir, out_filename)
+        # Output path: persistent cache dir
+        out_filename = _unique_filename(OUTPUT_DIR, lut_name, "cube")
+        out_path = os.path.join(OUTPUT_DIR, out_filename)
 
-        try:
-            result = build_lut(
-                all_source_colors,
-                all_target_colors,
-                source_log,
-                target_log,
-                lut_name,
-                out_path,
-            )
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        if mode == "reference":
+            display_transform = data.get("display_transform", "Rec709 (BT.709)")
+            try:
+                result = build_display_lut(
+                    all_source_colors, all_target_colors,
+                    source_log, display_transform,
+                    lut_name, out_path,
+                )
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        else:
+            try:
+                result = build_lut(
+                    all_source_colors, all_target_colors,
+                    source_log, target_log,
+                    lut_name, out_path,
+                )
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
 
         return jsonify({
             "mse": result["mse"],
@@ -219,14 +278,86 @@ def create_app(frontend_dir: str | None = None) -> Flask:
             "download_url": f"/api/download/{out_filename}",
         })
 
+    @app.post("/api/generate-reference-luts")
+    def api_generate_reference_luts():
+        """
+        Generates one LUT per source camera matched against a common display-referred reference.
+        Body:
+        {
+          "reference_warped_id": "...",
+          "reference_patches": [...],
+          "display_transform": "Rec709 (BT.709)",
+          "sources": [
+            ...
+          ]
+        }
+        """
+        cleanup_old_sessions()
+        data = request.get_json(force=True)
+
+        ref_warped_id = data.get("reference_warped_id")
+        ref_patches = data.get("reference_patches")
+        display_transform = data.get("display_transform", "Rec709 (BT.709)")
+        sources = data.get("sources", [])
+
+        if not ref_warped_id or not ref_patches or not sources:
+            return jsonify({"error": "Missing required parameters"}), 400
+
+        if ref_warped_id not in SESSIONS:
+            return jsonify({"error": "Unknown reference warped image ID"}), 404
+            
+        SESSIONS[ref_warped_id]["timestamp"] = time.time()
+
+        ref_warped = np.load(SESSIONS[ref_warped_id]["warped_path"])
+        ref_colors = extract_patches(ref_warped, ref_patches)
+
+        out_dir = OUTPUT_DIR
+        results = []
+
+        for src in sources:
+            src_warped_id = src.get("source_warped_id")
+            src_patches = src.get("source_patches")
+            source_log = src.get("source_log")
+            camera_name = src.get("camera_name", "Source")
+
+            if src_warped_id not in SESSIONS:
+                return jsonify({"error": f"Unknown source warped ID: {src_warped_id}"}), 404
+                
+            SESSIONS[src_warped_id]["timestamp"] = time.time()
+
+            src_warped = np.load(SESSIONS[src_warped_id]["warped_path"])
+            src_colors = extract_patches(src_warped, src_patches)
+
+            lut_name = f"{camera_name}_DisplayMatch"
+            out_filename = _unique_filename(out_dir, lut_name, "cube")
+            out_path = os.path.join(out_dir, out_filename)
+
+            try:
+                result = build_display_lut(
+                    src_colors, ref_colors,
+                    source_log, display_transform,
+                    lut_name, out_path,
+                )
+            except Exception as e:
+                return jsonify({"error": f"LUT generation failed for {camera_name}: {e}"}), 500
+
+            results.append({
+                "camera_name": camera_name,
+                "source_log": source_log,
+                "mse": result["mse"],
+                "filename": out_filename,
+                "download_url": f"/api/download/{out_filename}",
+            })
+
+        return jsonify({"results": results})
+
     # ------------------------------------------------------------------
     # API: Download .cube file
     # ------------------------------------------------------------------
 
     @app.get("/api/download/<filename>")
     def api_download(filename: str):
-        tmp_dir = tempfile.gettempdir()
-        file_path = os.path.join(tmp_dir, filename)
+        file_path = os.path.join(OUTPUT_DIR, filename)
         if not os.path.isfile(file_path):
             return jsonify({"error": "File not found"}), 404
         return send_file(file_path, as_attachment=True, download_name=filename)

@@ -5,7 +5,7 @@
 const App = (() => {
   // ── State ──────────────────────────────────────────────
   const state = {
-    mode: null,          // 'single' | 'master'
+    mode: null,          // 'single' | 'master' | 'reference'
     sourceLog: null,
     targetLog: null,
     allProfiles: [],
@@ -29,12 +29,32 @@ const App = (() => {
 
     lutName: 'CameraMatch',
     step: 1,
+
+    // ── Reference mode ──
+    refImgId: null,
+    refWarpedId: null,
+    refPatches: null,
+    refDefaultPatches: null,
+    refName: '',
+    refWarpedSrc: '',
+    refWarpedW: 0,
+    refWarpedH: 0,
+    displayGamma: null,
+    allDisplayGammas: [],
+    sourceCameras: [],  // [{imgId, warpedId, patches, defaultPatches, log, name, warpedSrc}]
   };
 
   // ── Helpers ────────────────────────────────────────────
   function $ (id) { return document.getElementById(id); }
   function show (el) { if (typeof el === 'string') el = $(el); el?.classList.remove('hidden'); }
   function hide (el) { if (typeof el === 'string') el = $(el); el?.classList.add('hidden'); }
+
+  // Capture original step-3 HTML so we can restore it after reference mode
+  let _originalStep3GridHTML = null;
+  (function _captureStep3() {
+    const grid = document.getElementById('logSelectGrid');
+    if (grid) _originalStep3GridHTML = grid.innerHTML;
+  })();
 
   async function api (method, path, body) {
     const opts = { method, headers: {} };
@@ -72,11 +92,22 @@ const App = (() => {
     state.mode = m;
     state.pairs = [];
     state.currentPairIdx = 0;
+    state.sourceCameras = [];
+    state.refImgId = null;
+    state.refWarpedId = null;
+    state.refPatches = null;
+    state.displayGamma = null;
     document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
-    $(m === 'single' ? 'btnSingle' : 'btnMaster').classList.add('selected');
+    const btnMap = { single: 'btnSingle', master: 'btnMaster', reference: 'btnReference' };
+    const btnId = btnMap[m];
+    if (btnId) $(btnId).classList.add('selected');
 
     setTimeout(() => {
-      buildImageSlots();
+      if (m === 'reference') {
+        loadRefProfilesForStep2().then(() => buildRefImageSlots());
+      } else {
+        buildImageSlots();
+      }
       goStep(2);
     }, 180);
   }
@@ -199,8 +230,187 @@ const App = (() => {
   }
 
   function checkStep2Next () {
+    if (state.mode === 'reference') {
+      const refReady = state.refImgId && state.displayGamma;
+      const sourcesReady = state.sourceCameras.length > 0 && state.sourceCameras.every(c => c.imgId && c.log);
+      $('step2Next').disabled = !(refReady && sourcesReady);
+      return;
+    }
     const allLoaded = state.pairs.every(p => p.sourceImgId && p.targetImgId);
     $('step2Next').disabled = !allLoaded;
+  }
+
+  // ── Reference-mode image slots ─────────────────
+  function buildRefImageSlots () {
+    const container = $('imageSlots');
+    if (!container) return;
+    container.innerHTML = '';
+
+    let html = '<div class="ref-section"><h3 class="ref-section-title">🔘 REFERENZ-Bild (fertiger Look / Display)</h3>';
+    html += `<div class="pair-slots-row">
+      <div class="drop-slot ${state.refImgId ? 'loaded' : ''}" id="slot-ref-reference"
+           data-role="ref-reference" style="flex:1"
+           onclick="App._refSlotClick('reference')">
+        <div class="drop-slot-inner">
+          <div class="drop-slot-role reference-label">REFERENZ (Final Look)</div>
+          <svg class="drop-slot-icon" width="32" height="32" viewBox="0 0 32 32" fill="none">
+            <path d="M16 4v16M8 12l8-8 8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+            <rect x="4" y="22" width="24" height="6" rx="2" stroke="currentColor" stroke-width="1.5" opacity="0.3"/>
+          </svg>
+          <span class="drop-slot-label" id="slot-lbl-ref-reference">Klicken oder ziehen</span>
+          <span style="font-size:11px;color:var(--text-3)">z.B. S1II Screengrab mit LUT</span>
+        </div>
+        <img class="drop-slot-thumb" id="slot-thumb-ref-reference" src="${state.refImgId ? state.cornerState[state.refImgId]?.imgSrc || '' : ''}" style="${state.refImgId ? '' : 'display:none'}" alt="" draggable="false"/>
+      </div>
+      <div class="ref-gamma-box" id="refGammaBox">
+        <div class="log-label target-label"><span class="log-dot target"></span> Referenz Display</div>
+        <select class="ref-select" id="refGammaSelect" onchange="App.selectDisplayGamma(this.value)">
+          <option value="">-- Display wählen --</option>
+          ${(state.allDisplayGammas.length ? state.allDisplayGammas : ['Rec709 (BT.709)','sRGB','Gamma 2.4','Gamma 2.2']).map(g => {
+            return `<option value="${g}" ${state.displayGamma === g ? 'selected' : ''}>${g}</option>`;
+          }).join('')}
+        </select>
+      </div>
+    </div></div>`;
+
+    html += '<div class="ref-section"><h3 class="ref-section-title">📷 SOURCE-Kameras (Log)</h3>';
+
+    if (state.sourceCameras.length === 0) state.sourceCameras.push({ imgId: null, warpedId: null, patches: null, defaultPatches: null, log: null, name: '', warpedSrc: '' });
+
+    state.sourceCameras.forEach((cam, idx) => {
+      html += `<div class="pair-slots-row" id="ref-source-row-${idx}">
+        <div class="drop-slot ${cam.imgId ? 'loaded' : ''}" id="slot-ref-source-${idx}"
+             data-role="ref-source-${idx}" style="flex:1"
+             onclick="App._refSlotClick('source', ${idx})">
+          <div class="drop-slot-inner">
+            <div class="drop-slot-role source">SOURCE ${idx + 1}</div>
+            <svg class="drop-slot-icon" width="32" height="32" viewBox="0 0 32 32" fill="none">
+              <path d="M16 4v16M8 12l8-8 8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+              <rect x="4" y="22" width="24" height="6" rx="2" stroke="currentColor" stroke-width="1.5" opacity="0.3"/>
+            </svg>
+            <span class="drop-slot-label" id="slot-lbl-ref-source-${idx}">Klicken oder ziehen</span>
+            <span style="font-size:11px;color:var(--text-3)">z.B. S5IIX, Mavic4, ZX-V, GoPro</span>
+          </div>
+          <img class="drop-slot-thumb" id="slot-thumb-ref-source-${idx}" src="${cam.imgId ? state.cornerState[cam.imgId]?.imgSrc || '' : ''}" style="${cam.imgId ? '' : 'display:none'}" alt="" draggable="false"/>
+        </div>
+        <div class="ref-source-controls">
+          <div class="log-label source-label"><span class="log-dot source"></span> Log-Profil</div>
+          <input type="text" class="search-input ref-search" id="refSourceSearch-${idx}" placeholder="Suche... z.B. V-Log" oninput="App.filterRefSourceLog(${idx}, this.value)" autocomplete="off"/>
+          <div class="log-list-wrap" id="refSourceLogList-${idx}" style="max-height:120px">`;
+      (state.allProfiles.length ? state.allProfiles : []).forEach(p => {
+        const sel = cam.log === p ? ' selected' : '';
+        html += `<div class="log-item${sel}" onclick="App.selectRefSourceLog(${idx}, '${p}')">${p}</div>`;
+      });
+      html += `</div>
+          <div class="log-selected ${cam.log ? 'set' : ''}" id="refSourceLogSelected-${idx}">${cam.log || 'Kein Profil'}</div>
+        </div>
+        <button class="btn-ghost small ref-delete-btn" onclick="App.removeRefSource(${idx})" title="Source entfernen">✕</button>
+      </div>`;
+    });
+
+    html += '</div>';
+
+    container.innerHTML = html;
+
+    $('masterAddBtn')?.classList.remove('hidden');
+    const addBtn = $('masterAddBtn');
+    if (addBtn) {
+      addBtn.innerHTML = `<button class="btn-secondary" onclick="App.addRefSource()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        Weitere Source-Kamera hinzufügen
+      </button>`;
+    }
+
+    wireRefDropSlots();
+    checkStep2Next();
+  }
+
+  function wireRefDropSlots () {
+    document.querySelectorAll('.drop-slot[id^="slot-ref-"]').forEach(slot => {
+      slot.addEventListener('dragover', e => { e.preventDefault(); slot.classList.add('dragover'); });
+      slot.addEventListener('dragleave', () => slot.classList.remove('dragover'));
+      slot.addEventListener('drop', e => {
+        e.preventDefault();
+        slot.classList.remove('dragover');
+        const file = e.dataTransfer.files[0];
+        if (!file) return;
+        const role = slot.dataset.role;
+        if (role === 'ref-reference') uploadRefImage('reference', file);
+        else if (role.startsWith('ref-source-')) {
+          const idx = parseInt(role.replace('ref-source-', ''));
+          uploadRefImage('source', file, idx);
+        }
+      });
+    });
+  }
+
+  function _refSlotClick (role, idx) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.tif,.tiff,.jpg,.jpeg,.png';
+    input.onchange = () => {
+      if (input.files[0]) {
+        if (role === 'reference') uploadRefImage('reference', input.files[0]);
+        else uploadRefImage('source', input.files[0], idx);
+      }
+    };
+    input.click();
+  }
+
+  async function uploadRefImage (role, file, idx) {
+    let lblEl, thumbEl;
+    if (role === 'reference') {
+      lblEl = $('slot-lbl-ref-reference');
+      thumbEl = $('slot-thumb-ref-reference');
+    } else {
+      lblEl = $(`slot-lbl-ref-source-${idx}`);
+      thumbEl = $(`slot-thumb-ref-source-${idx}`);
+    }
+    lblEl.textContent = '⏳ Wird geladen…';
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await api('POST', '/api/upload', fd);
+
+      if (role === 'reference') {
+        state.refImgId = res.img_id;
+        state.refName = res.filename;
+      } else {
+        if (!state.sourceCameras[idx]) state.sourceCameras[idx] = { imgId: null, warpedId: null, patches: null, defaultPatches: null, log: null, name: '', warpedSrc: '' };
+        state.sourceCameras[idx].imgId = res.img_id;
+        state.sourceCameras[idx].name = res.filename;
+      }
+
+      state.cornerState[res.img_id] = {
+        corners: [],
+        imgSrc: res.preview,
+        displayW: res.width,
+        displayH: res.height,
+      };
+
+      thumbEl.src = res.preview;
+      thumbEl.style.display = 'block';
+      const slotEl = role === 'reference' ? $('slot-ref-reference') : $(`slot-ref-source-${idx}`);
+      if (slotEl) slotEl.classList.add('loaded');
+      lblEl.textContent = file.name;
+
+    } catch (err) {
+      lblEl.textContent = `Fehler: ${err.message}`;
+    }
+    checkStep2Next();
+  }
+
+  function addRefSource () {
+    state.sourceCameras.push({ imgId: null, warpedId: null, patches: null, defaultPatches: null, log: null, name: '', warpedSrc: '' });
+    buildRefImageSlots();
+  }
+
+  function removeRefSource (idx) {
+    if (state.sourceCameras.length <= 1) return;
+    const cam = state.sourceCameras[idx];
+    if (cam.imgId) delete state.cornerState[cam.imgId];
+    state.sourceCameras.splice(idx, 1);
+    buildRefImageSlots();
   }
 
   function addMasterPair () {
@@ -209,12 +419,31 @@ const App = (() => {
   }
 
   function step2Next () {
-    loadLogProfiles();
-    goStep(3);
+    if (state.mode === 'reference') {
+      state.lutName = 'RefMatch';
+      state.refWarpedId = null;
+      state.sourceCameras.forEach(c => { c.warpedId = null; });
+      startRefCornerFlow();
+      return;
+    }
+    if (state.mode === 'single' || state.mode === 'master') {
+      loadLogProfiles();
+      goStep(3);
+    }
   }
 
   // ── STEP 3 ─────────────────────────────────────────────
   async function loadLogProfiles () {
+    // Restore original step-3 layout for single/master mode
+    const grid = $('logSelectGrid');
+    if (grid && _originalStep3GridHTML) grid.innerHTML = _originalStep3GridHTML;
+
+    // Reset step-3 header for single/master mode
+    const title = $('step3Title');
+    const sub = $('step3Sub');
+    if (title) title.textContent = 'Kamera Log-Profile';
+    if (sub) sub.textContent = 'Wähle das Log-Profil für Quelle und Ziel.';
+
     if (state.allProfiles.length) { renderLogLists(); return; }
     try {
       const profiles = await api('GET', '/api/log-profiles');
@@ -278,6 +507,18 @@ const App = (() => {
   }
 
   function step3Next () {
+    if (state.mode === 'reference') {
+      if (!state.displayGamma || state.sourceCameras.some(c => !c.log)) {
+        $('step3Next').disabled = true;
+        return;
+      }
+      state.lutName = 'RefMatch';
+      // Reset warp data
+      state.refWarpedId = null;
+      state.sourceCameras.forEach(c => { c.warpedId = null; });
+      startRefCornerFlow();
+      return;
+    }
     // Build lut name from first pair
     const p = state.pairs[0];
     const sn = p.sourceName ? p.sourceName.replace(/\.[^.]+$/, '') : 'Source';
@@ -287,6 +528,225 @@ const App = (() => {
     // Reset corner progress for all pairs
     state.pairs.forEach(p => { p.sourceWarpedId = null; p.targetWarpedId = null; });
     startCornerFlow();
+  }
+
+  // ── Reference-mode step 2 profile loading ────
+  async function loadRefProfilesForStep2 () {
+    try {
+      if (!state.allProfiles.length) state.allProfiles = await api('GET', '/api/log-profiles');
+      if (!state.allDisplayGammas.length) state.allDisplayGammas = await api('GET', '/api/display-gammas');
+    } catch (e) { console.error('Failed to load profiles', e); }
+  }
+
+  // ── Reference-mode step 3 (profiles) ──────────
+  // (kept for backward compat, step 3 is now skipped in reference mode)
+  async function loadRefProfiles () {
+    try {
+      if (!state.allProfiles.length) state.allProfiles = await api('GET', '/api/log-profiles');
+      if (!state.allDisplayGammas.length) state.allDisplayGammas = await api('GET', '/api/display-gammas');
+    } catch (e) { console.error('Failed to load profiles', e); }
+  }
+
+  function renderRefProfileStep () {
+    const grid = $('logSelectGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    // Update step header for reference mode
+    const title = $('step3Title');
+    const sub = $('step3Sub');
+    if (title) title.textContent = 'Referenz & Camera Profile';
+    if (sub) sub.textContent = 'Wähle Display-Gamma für die Referenz und das Log-Profil für jede Source-Kamera.';
+
+    // Reference display gamma
+    let html = `<div class="log-select-card">
+      <div class="log-label target-label">
+        <span class="log-dot target"></span> REFERENZ Display Gamma
+      </div>
+      <p class="log-hint">Farbraum des Referenzbilds (z.B. Rec709 = Gamma 2.4)</p>
+      <div class="log-list-wrap">`;
+    state.allDisplayGammas.forEach(g => {
+      const sel = state.displayGamma === g ? ' selected' : '';
+      html += `<div class="gamma-option${sel}" onclick="App.selectDisplayGamma('${g}')">${g}</div>`;
+    });
+    html += `</div>
+      <div class="log-selected ${state.displayGamma ? 'set' : ''}" id="refGammaSelected">${state.displayGamma || 'Kein Gamma gewählt'}</div>
+    </div>`;
+
+    // Source log profiles (one per source camera)
+    state.sourceCameras.forEach((cam, idx) => {
+      html += `<div class="log-select-card">
+        <div class="log-label source-label">
+          <span class="log-dot source"></span> SOURCE ${idx + 1}: ${cam.name || '(kein Bild)'}
+        </div>
+        <p class="log-hint">Log-Profil dieser Kamera (z.B. V-Log, D-Log, S-Log3)</p>
+        <input type="text" class="search-input" placeholder="Suche..." oninput="App.filterRefSourceLog(${idx}, this.value)" autocomplete="off"/>
+        <div class="log-list-wrap" id="refSourceLogList-${idx}">`;
+      state.allProfiles.forEach(p => {
+        const sel = cam.log === p ? ' selected' : '';
+        html += `<div class="log-item${sel}" onclick="App.selectRefSourceLog(${idx}, '${p}')">${p}</div>`;
+      });
+      html += `</div>
+        <div class="log-selected ${cam.log ? 'set' : ''}" id="refSourceLogSelected-${idx}">${cam.log || 'Kein Profil gewählt'}</div>
+      </div>`;
+    });
+
+    grid.innerHTML = html;
+    $('step3Next').disabled = !(state.displayGamma && state.sourceCameras.every(c => c.log));
+  }
+
+  function selectDisplayGamma (gammaOrVal) {
+    state.displayGamma = gammaOrVal;
+    checkStep2Next();
+  }
+
+  function selectRefSourceLog (idx, logName) {
+    if (!state.sourceCameras[idx]) return;
+    state.sourceCameras[idx].log = logName;
+    $('refSourceLogSelected-' + idx).textContent = logName;
+    $('refSourceLogSelected-' + idx).classList.add('set');
+    checkStep2Next();
+    // Update list selection
+    const listEl = $(`refSourceLogList-${idx}`);
+    if (listEl) {
+      listEl.innerHTML = '';
+      state.allProfiles.forEach(p => {
+        const sel = state.sourceCameras[idx]?.log === p ? ' selected' : '';
+        listEl.innerHTML += `<div class="log-item${sel}" onclick="App.selectRefSourceLog(${idx}, '${p}')">${p}</div>`;
+      });
+    }
+  }
+
+  function filterRefSourceLog (idx, query) {
+    const filtered = state.allProfiles.filter(p => p.toLowerCase().includes(query.toLowerCase()));
+    const listEl = $(`refSourceLogList-${idx}`);
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    filtered.forEach(p => {
+      const sel = state.sourceCameras[idx]?.log === p ? ' selected' : '';
+      listEl.innerHTML += `<div class="log-item${sel}" onclick="App.selectRefSourceLog(${idx}, '${p}')">${p}</div>`;
+    });
+  }
+
+  // ── Reference-mode corner flow ─────────────────
+  let refCornerQueue = [];
+  let refCornerPos = 0;
+
+  function startRefCornerFlow () {
+    refCornerQueue = [];
+    // Reference first
+    if (state.refImgId) refCornerQueue.push({ type: 'reference', imgId: state.refImgId });
+    // Then each source
+    state.sourceCameras.forEach((cam, i) => {
+      if (cam.imgId) refCornerQueue.push({ type: 'source', idx: i, imgId: cam.imgId });
+    });
+    refCornerPos = 0;
+    loadRefCornerStep();
+  }
+
+  function loadRefCornerStep () {
+    if (refCornerPos >= refCornerQueue.length) {
+      startRefPatchFlow();
+      return;
+    }
+    const { type, idx, imgId } = refCornerQueue[refCornerPos];
+    const cs = state.cornerState[imgId];
+    if (cs) cs.corners = [];
+
+    const label = type === 'reference' ? 'REFERENZ-Bild' : `SOURCE ${idx + 1}: ${state.sourceCameras[idx]?.name || ''}`;
+    $('step4Title').textContent = `${label} — Ecken markieren`;
+    $('step4Next').disabled = true;
+    state.currentCornerImg = imgId;
+
+    goStep(4);
+    if (cs) setupCornerCanvas(cs);
+  }
+
+  async function refStep4Next () {
+    $('step4Next').disabled = true;
+    $('step4Next').textContent = '⏳ Wird verarbeitet…';
+
+    const { type, idx, imgId } = refCornerQueue[refCornerPos];
+    const cs = state.cornerState[imgId];
+
+    try {
+      const res = await api('POST', '/api/warp', { img_id: imgId, corners: cs.corners });
+      if (type === 'reference') {
+        state.refWarpedId = res.warped_id;
+        state.refDefaultPatches = res.patch_centers;
+        state.refWarpedSrc = res.preview;
+        state.refWarpedW = res.width;
+        state.refWarpedH = res.height;
+      } else {
+        state.sourceCameras[idx].warpedId = res.warped_id;
+        state.sourceCameras[idx].defaultPatches = res.patch_centers;
+        state.sourceCameras[idx].warpedSrc = res.preview;
+      }
+    } catch (err) {
+      alert(`Warp-Fehler: ${err.message}`);
+      $('step4Next').disabled = false;
+      $('step4Next').textContent = 'Ecken bestätigen →';
+      return;
+    }
+
+    $('step4Next').textContent = 'Ecken bestätigen →';
+    refCornerPos++;
+    loadRefCornerStep();
+  }
+
+  function refCornerBack () {
+    if (refCornerPos > 0) { refCornerPos--; loadRefCornerStep(); }
+    else goStep(3);
+  }
+
+  // ── Reference-mode patch flow ──────────────────
+  let refPatchQueue = [];
+  let refPatchPos = 0;
+
+  function startRefPatchFlow () {
+    refPatchQueue = [];
+    // Reference first
+    refPatchQueue.push({ type: 'reference', warpedId: state.refWarpedId, warpedSrc: state.refWarpedSrc, defaultPatches: state.refDefaultPatches });
+    // Then each source
+    state.sourceCameras.forEach((cam, i) => {
+      refPatchQueue.push({ type: 'source', idx: i, warpedId: cam.warpedId, warpedSrc: cam.warpedSrc, defaultPatches: cam.defaultPatches });
+    });
+    refPatchPos = 0;
+    loadRefPatchStep();
+  }
+
+  function loadRefPatchStep () {
+    if (refPatchPos >= refPatchQueue.length) {
+      generateRefLUTs();
+      return;
+    }
+    const { type, idx, warpedId, warpedSrc, defaultPatches } = refPatchQueue[refPatchPos];
+    const label = type === 'reference' ? 'REFERENZ-Bild' : `SOURCE ${idx + 1}: ${state.sourceCameras[idx]?.name || ''}`;
+    $('step5Title').textContent = `${label} — Patches feinjustieren`;
+    $('step5NextLabel').textContent = refPatchPos === refPatchQueue.length - 1 ? 'LUTs generieren →' : 'Weiter →';
+
+    state.currentPatchWarpedId = warpedId;
+    state.defaultPatchCenters = defaultPatches.map(([x, y]) => [x, y]);
+    state.currentPatchCenters = defaultPatches.map(([x, y]) => [x, y]);
+
+    goStep(5);
+    setupPatchCanvas(warpedSrc, state.currentPatchCenters);
+  }
+
+  function refStep5Next () {
+    const { type, idx } = refPatchQueue[refPatchPos];
+    const centers = state.currentPatchCenters.map(p => [...p]);
+    if (type === 'reference') state.refPatches = centers;
+    else state.sourceCameras[idx].patches = centers;
+
+    refPatchPos++;
+    loadRefPatchStep();
+  }
+
+  function refPatchBack () {
+    if (refPatchPos > 0) refPatchPos--;
+    else { refCornerPos = refCornerQueue.length - 1; loadRefCornerStep(); return; }
+    loadRefPatchStep();
   }
 
   // ── STEP 4 – CORNER MARKING ────────────────────────────
@@ -329,7 +789,15 @@ const App = (() => {
     const img = $('cornerImg');
     const canvas = $('cornerCanvas');
     img.src = cs.imgSrc;
-    img.onload = () => { resizeCanvas(canvas, img); drawCorners(canvas, cs.corners); };
+    img.onload = () => {
+      // Wait for CSS layout to complete before reading client dimensions
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          resizeCanvas(canvas, img);
+          drawCorners(canvas, cs.corners);
+        });
+      });
+    };
     // Reset dot indicators
     for (let i = 0; i < 4; i++) {
       const d = $(`cdot${i}`);
@@ -436,6 +904,7 @@ const App = (() => {
   }
 
   async function step4Next () {
+    if (state.mode === 'reference') { await refStep4Next(); return; }
     $('step4Next').disabled = true;
     $('step4Next').textContent = '⏳ Wird verarbeitet…';
 
@@ -469,6 +938,7 @@ const App = (() => {
   }
 
   function cornerBack () {
+    if (state.mode === 'reference') { refCornerBack(); return; }
     if (cornerQueuePos > 0) {
       cornerQueuePos--;
       loadCornerStep();
@@ -598,6 +1068,7 @@ const App = (() => {
   }
 
   function step5Next () {
+    if (state.mode === 'reference') { refStep5Next(); return; }
     // Save current patch centers into pair
     const { pairIdx, role } = patchQueue[patchQueuePos];
     const pair = state.pairs[pairIdx];
@@ -609,14 +1080,97 @@ const App = (() => {
   }
 
   function patchBack () {
+    if (state.mode === 'reference') { refPatchBack(); return; }
     if (patchQueuePos > 0) patchQueuePos--;
     else { cornerQueuePos = cornerQueue.length - 1; loadCornerStep(); return; }
     loadPatchStep();
   }
 
-  // ── STEP 6 – GENERATE LUT ─────────────────────────────
-  // Stores the last generated LUT temp filename for save dialog
-  let _lastLutFilename = null;
+  // ── Reference-mode LUT generation ──────────────
+  let _lastRefResults = [];
+
+  async function generateRefLUTs () {
+    goStep(6);
+    show('stateGenerating');
+    hide('stateSuccess');
+    hide('stateError');
+
+    const sources = state.sourceCameras.map(cam => ({
+      source_warped_id: cam.warpedId,
+      source_patches: cam.patches,
+      source_log: cam.log,
+      camera_name: cam.name ? cam.name.replace(/\.[^.]+$/, '') : 'Source',
+    }));
+
+    try {
+      const res = await api('POST', '/api/generate-reference-luts', {
+        reference_warped_id: state.refWarpedId,
+        reference_patches: state.refPatches,
+        display_transform: state.displayGamma || "Rec709 (BT.709)",
+        sources,
+      });
+
+      _lastRefResults = res.results;
+      _lastLutFilename = res.results[0]?.filename || null;
+
+      hide('stateGenerating');
+      show('stateSuccess');
+
+      const lines = res.results.map(r =>
+        `<b>${r.camera_name}</b> (${r.source_log}): ${r.filename} — MSE: ${r.mse.toFixed(6)}`
+      ).join('<br/>');
+
+      $('resultMeta').innerHTML = `
+        <b>Modus:</b> Reference Match LUT — ${res.results.length} Kamera(s)<br/>
+        <b>Referenz Gamma:</b> ${state.displayGamma}<br/><br/>
+        ${lines}
+      `;
+
+      $('addSceneBtn').style.display = 'none';
+      // Add a button to save all
+      const saveAllBtn = document.createElement('button');
+      saveAllBtn.className = 'btn-primary';
+      saveAllBtn.style.marginTop = '12px';
+      saveAllBtn.id = 'btnSaveAllLuts';
+      saveAllBtn.innerHTML = '💾 Alle LUTs speichern';
+      saveAllBtn.onclick = saveAllRefLuts;
+      const actionsDiv = document.querySelector('.result-actions');
+      if (actionsDiv && !$('btnSaveAllLuts')) {
+        actionsDiv.insertBefore(saveAllBtn, actionsDiv.firstChild);
+      }
+
+    } catch (err) {
+      hide('stateGenerating');
+      show('stateError');
+      $('errorMsg').textContent = err.message;
+    }
+  }
+
+  async function saveAllRefLuts () {
+    if (!_lastRefResults.length) return;
+    const btn = $('btnSaveAllLuts');
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = '⏳ Speichere…';
+    let saved = 0;
+    for (const r of _lastRefResults) {
+      try {
+        if (window.pywebview && window.pywebview.api) {
+          const result = await window.pywebview.api.save_lut(r.filename, r.filename);
+          if (result.success) saved++;
+        } else {
+          const a = document.createElement('a');
+          a.href = `/api/download/${r.filename}`;
+          a.download = r.filename;
+          a.click();
+          saved++;
+          await new Promise(r => setTimeout(r, 300));
+        }
+      } catch (e) { console.error('Save failed', e); }
+    }
+    btn.textContent = `✓ ${saved}/${_lastRefResults.length} gespeichert`;
+    btn.disabled = true;
+  }
 
   async function generateLUT () {
     goStep(6);
@@ -726,8 +1280,25 @@ const App = (() => {
     state.targetLog = null;
     state.pairs = [];
     state.cornerState = {};
+    state.refImgId = null;
+    state.refWarpedId = null;
+    state.refPatches = null;
+    state.displayGamma = null;
+    state.sourceCameras = [];
+    _lastRefResults = [];
     cornerQueue = [];
     patchQueue = [];
+    refCornerQueue = [];
+    refPatchQueue = [];
+
+    // Restore original step-3 grid
+    const grid = $('logSelectGrid');
+    if (grid && _originalStep3GridHTML) grid.innerHTML = _originalStep3GridHTML;
+    const title = $('step3Title');
+    const sub = $('step3Sub');
+    if (title) title.textContent = 'Kamera Log-Profile';
+    if (sub) sub.textContent = 'Wähle das Log-Profil für Quelle und Ziel.';
+
     document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
     $('sourceSelected').textContent = 'Kein Profil gewählt';
     $('sourceSelected').classList.remove('set');
@@ -735,6 +1306,8 @@ const App = (() => {
     $('targetSelected').classList.remove('set');
     $('sourceSearch').value = '';
     $('targetSearch').value = '';
+    const saveAllBtn = $('btnSaveAllLuts');
+    if (saveAllBtn) saveAllBtn.remove();
     goStep(1);
   }
 
@@ -747,5 +1320,9 @@ const App = (() => {
     resetPatches, step5Next, patchBack,
     saveLut, openFolder,
     addAnotherScene, restart,
+    // Reference mode
+    _refSlotClick, addRefSource, removeRefSource,
+    selectDisplayGamma, selectRefSourceLog, filterRefSourceLog,
+    saveAllRefLuts,
   };
 })();

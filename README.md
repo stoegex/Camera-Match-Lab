@@ -22,7 +22,7 @@ It is designed for matching one camera or log profile to another by sampling cha
 5. Generate and save the LUT.
 
 For broader matching across lighting conditions, use Master mode and add multiple scene pairs.
-
+ 
 ## Tech Stack
 
 - Python

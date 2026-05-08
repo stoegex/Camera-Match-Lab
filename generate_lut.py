@@ -209,6 +209,225 @@ def select_log_profiles():
         
     return available_curves[source_curve_idx], available_curves[target_curve_idx]
 
+
+def select_display_transform():
+    display_options = ['Rec709 (BT.709)', 'sRGB', 'Gamma 2.4', 'Gamma 2.2']
+
+    print("\nReferenz-Farbraum (Display-Transferfunktion):")
+    print("Deine Referenz ist ein Screengrab mit bereits gebakener LUT (Display-Referenz).")
+    print("Waehle die Transfer-Kurve, mit der das Referenzbild kodiert ist:")
+    print("  Rec709 (BT.709) = echte BT.709 OETF (kein simples Gamma!)")
+    print("  sRGB            = echte sRGB OETF")
+    print("  Gamma 2.4 / 2.2 = reines Power-Law (Fallback)")
+    for i, name in enumerate(display_options):
+        print(f"  [{i}] {name}")
+    try:
+        idx = int(input("Auswahl: "))
+    except ValueError:
+        print("Fehler: Bitte eine gueltige Nummer eingeben.")
+        sys.exit(1)
+    if idx < 0 or idx >= len(display_options):
+        print("Fehler: Ungueltige Auswahl.")
+        sys.exit(1)
+    return display_options[idx]
+
+
+def _apply_display_decode_display_to_linear(ref_colors, transform_name):
+    """Decode display-referred values to linear using proper OETF inverse."""
+    import colour
+    x = np.clip(ref_colors, 0.0, 1.0)
+    if transform_name == 'Rec709 (BT.709)':
+        return colour.models.oetf_inverse_BT709(x)
+    el    if transform_name == 'sRGB':
+        return colour.models.eotf_sRGB(x)
+    elif transform_name == 'Gamma 2.4':
+        return np.power(x, 2.4)
+    elif transform_name == 'Gamma 2.2':
+        return np.power(x, 2.2)
+    else:
+        return np.power(x, 2.4)
+
+
+def _apply_display_encode_linear_to_display(linear, transform_name):
+    """Encode linear values to display space using proper OETF."""
+    import colour
+    x = np.clip(linear, 1e-6, 100.0)
+    if transform_name == 'Rec709 (BT.709)':
+        return np.clip(colour.models.oetf_BT709(x), 0.0, 1.0)
+    elif transform_name == 'sRGB':
+        return np.clip(colour.models.eotf_inverse_sRGB(x), 0.0, 1.0)
+    elif transform_name == 'Gamma 2.4':
+        return np.clip(np.power(x, 1.0 / 2.4), 0.0, 1.0)
+    elif transform_name == 'Gamma 2.2':
+        return np.clip(np.power(x, 1.0 / 2.2), 0.0, 1.0)
+    else:
+        return np.clip(np.power(x, 1.0 / 2.4), 0.0, 1.0)
+
+
+def select_source_log_profile():
+    import colour
+    available_curves = sorted(list(colour.models.LOG_ENCODINGS.keys()))
+
+    print("\nVerfuegbare Kamera Log-Profile:")
+    for i, curve in enumerate(available_curves):
+        print(f"  [{i}] {curve}")
+
+    try:
+        idx = int(input("\nWelches Log-Profil nutzt diese Source-Kamera? "))
+    except ValueError:
+        print("Fehler: Bitte eine gueltige Nummer eingeben.")
+        sys.exit(1)
+    if idx < 0 or idx >= len(available_curves):
+        print("Fehler: Ungueltige Nummernauswahl.")
+        sys.exit(1)
+    return available_curves[idx]
+
+
+def run_reference_match_mode():
+    print("\n--- REFERENCE MATCH LUT MODUS ---")
+    print("Dieser Modus gleicht mehrere Log-Kameras auf EIN Referenzbild ab.")
+    print("Die Referenz ist bereits im Display-Farbraum (fertiger Look mit LUT).")
+    print("=" * 50)
+
+    valid_exts = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']
+    files = sorted([f for f in os.listdir('.') if os.path.isfile(f) and any(f.lower().endswith(ext) for ext in valid_exts)])
+
+    if len(files) < 2:
+        print(f"Fehler: Mindestens 2 Bilddateien ({', '.join(valid_exts)}) im Ordner erforderlich.")
+        sys.exit(1)
+
+    display_transform = select_display_transform()
+
+    # ---- Select and process reference image ONCE ----
+    print("\n--- REFERENZBILD auswaehlen ---")
+    print("(Das Bild mit dem finalen Look, z.B. S1II Screengrab)")
+    print("\nGefundene Bilder:")
+    for i, f in enumerate(files):
+        print(f"  [{i}] {f}")
+
+    try:
+        ref_idx = int(input("\nWelche Nummer ist das REFERENZ-Bild? "))
+    except ValueError:
+        print("Fehler: Bitte eine gueltige Nummer eingeben.")
+        sys.exit(1)
+    if ref_idx < 0 or ref_idx >= len(files):
+        print("Fehler: Ungueltige Nummernauswahl.")
+        sys.exit(1)
+
+    ref_path = files[ref_idx]
+    ref_name = os.path.splitext(ref_path)[0]
+    ref_colors = process_single_image(ref_path, f"Referenz: {ref_name}")
+
+    # ---- Source batch loop ----
+    remaining = [f for i, f in enumerate(files) if i != ref_idx]
+    lut_count = 0
+
+    while remaining:
+        print(f"\n--- SOURCE-KAMERA ({len(remaining)} verbleibend) ---")
+        print("\nGefundene Bilder:")
+        for i, f in enumerate(remaining):
+            print(f"  [{i}] {f}")
+
+        try:
+            src_idx = int(input("\nWelche Nummer ist die SOURCE-Kamera? "))
+        except ValueError:
+            print("Fehler: Bitte eine gueltige Nummer eingeben.")
+            sys.exit(1)
+        if src_idx < 0 or src_idx >= len(remaining):
+            print("Fehler: Ungueltige Nummernauswahl.")
+            sys.exit(1)
+
+        src_path = remaining[src_idx]
+        src_name = os.path.splitext(src_path)[0]
+        source_log = select_source_log_profile()
+
+        src_colors = process_single_image(src_path, f"Source: {src_name}")
+
+        # Compute and save LUT
+        lut_name = f"{src_name}_to_{ref_name}_DisplayMatch"
+        out_filename = get_unique_filename(lut_name)
+
+        print(f"\nBerechne 3x3 Matrix + 65^3 LUT: {source_log} -> {display_transform} ...")
+
+        try:
+            source_lin = colour.models.log_decoding(src_colors, function=source_log)
+        except Exception as e:
+            print(f"Warnung: Log Decoding fehlgeschlagen ({e}). Nutze Gamma 2.4 Fallback.")
+            source_lin = np.power(np.clip(src_colors, 0, 1), 2.4)
+
+        ref_lin = _apply_display_decode_display_to_linear(ref_colors, display_transform)
+
+        weights = np.ones(len(source_lin))
+        gray_indices = [28, 29, 30, 31]
+        for i in range(len(source_lin)):
+            if (i % 32) in gray_indices:
+                weights[i] = 100.0
+        W = np.diag(weights)
+
+        source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
+        WX = np.dot(W, source_pad)
+        WY = np.dot(W, ref_lin)
+        matrix, residuals, rank, s = np.linalg.lstsq(WX, WY, rcond=None)
+
+        source_transformed_lin = np.dot(source_pad, matrix)
+        mse = np.mean((ref_lin - source_transformed_lin) ** 2)
+        print(f"Abweichung (MSE im Linear-Space): {mse:.6f}")
+
+        lut = colour.LUT3D(size=65, name=lut_name)
+        try:
+            grid_lin = colour.models.log_decoding(lut.table, function=source_log)
+        except Exception:
+            grid_lin = np.power(np.clip(lut.table, 0, 1), 2.4)
+
+        flat_grid_lin = grid_lin.reshape(-1, 3)
+        flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
+        flat_transformed_lin = np.dot(flat_grid_pad, matrix)
+        flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
+
+        flat_transformed_display = _apply_display_encode_linear_to_display(flat_transformed_lin, display_transform)
+        flat_transformed_display = np.clip(flat_transformed_display, 0.0, 1.0)
+
+        lut.table = flat_transformed_display.reshape((65, 65, 65, 3))
+        colour.write_LUT(lut, out_filename)
+
+        print(f"\nERFOLG! LUT gespeichert: {out_filename}")
+        lut_count += 1
+
+        remaining.pop(src_idx)
+
+        if remaining:
+            more = input("\nWeitere Source-Kamera verarbeiten? (j/n): ")
+            if more.lower() != 'j':
+                break
+
+    print(f"\n{'=' * 50}")
+    print(f"FERTIG! {lut_count} LUT(s) generiert.")
+    print(f"{'=' * 50}")
+
+
+def process_single_image(img_path, label):
+    print(f"\nLade Bild: {label} ({img_path})...")
+    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"Fehler: Konnte Bild nicht lesen: {img_path}")
+        sys.exit(1)
+
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]
+
+    is_16bit = img.dtype == np.uint16
+    if is_16bit:
+        img_float = (img / 65535.0).astype(np.float32)
+    else:
+        img_float = (img / 255.0).astype(np.float32)
+
+    img_display = (np.clip(img_float, 0, 1) * 255).astype(np.uint8)
+
+    pts = select_points(img_display, f"Ecken: {label}")
+    print(f"Extrahiere Farben aus {label}...")
+    colors = extract_patches(img_float, pts)
+    return colors
+
 def get_unique_filename(base_name, extension="cube"):
     filename = f"{base_name}.{extension}"
     counter = 2
@@ -225,8 +444,13 @@ def main():
     print("==================================================")
     print(" [1] SINGLE LUT (Ein Bildpaar abgleichen)")
     print(" [2] MASTER LUT (Mehrere Bildpaare / Lichtsituationen verschmelzen)")
-    mode = input("Waehle den Modus (1 oder 2): ")
-    
+    print(" [3] REFERENCE MATCH LUT (Referenz=fertiger Look, Sources=Log)")
+    mode = input("Waehle den Modus (1, 2 oder 3): ")
+
+    if mode.strip() == '3':
+        run_reference_match_mode()
+        return
+
     is_master_mode = mode.strip() == '2'
     
     valid_exts = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']

@@ -80,6 +80,19 @@
           <p>Mehrere Bildpaare verschmelzen &rarr;<br/>universelle LUT für alle Lichtsituationen.</p>
           <div class="mode-badge accent">Profimodus</div>
         </button>
+        <button class="mode-card" id="btnReference" onclick="App.selectMode('reference')">
+          <div class="mode-icon">
+            <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+              <rect x="4" y="4" width="32" height="32" rx="4" stroke="currentColor" stroke-width="2"/>
+              <rect x="10" y="10" width="20" height="20" rx="2" stroke="currentColor" stroke-width="1.5" opacity="0.7"/>
+              <circle cx="20" cy="20" r="6" stroke="currentColor" stroke-width="2"/>
+              <path d="M20 6v6M20 28v6M6 20h6M28 20h6" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+            </svg>
+          </div>
+          <h2>REFERENCE LUT</h2>
+          <p>Mehrere Log-Kameras auf ein fertiges<br/>Referenzbild (Look) abgleichen.</p>
+          <div class="mode-badge accent">Multi-Cam</div>
+        </button>
       </div>
     </section>
 
@@ -109,12 +122,12 @@
 
     <!-- ── STEP 3: LOG PROFILES ── -->
     <section class="step-panel" id="step-3">
-      <div class="step-header">
-        <h1 class="step-title">Kamera Log-Profile</h1>
-        <p class="step-sub">Wähle das Log-Profil für Quelle und Ziel.</p>
+      <div class="step-header" id="step3Header">
+        <h1 class="step-title" id="step3Title">Kamera Log-Profile</h1>
+        <p class="step-sub" id="step3Sub">Wähle das Log-Profil für Quelle und Ziel.</p>
       </div>
 
-      <div class="log-select-grid">
+      <div class="log-select-grid" id="logSelectGrid">
         <div class="log-select-card">
           <div class="log-label source-label">
             <span class="log-dot source"></span> QUELL-Kamera (Source)

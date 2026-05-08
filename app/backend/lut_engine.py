@@ -9,6 +9,111 @@ import colour
 
 
 # ---------------------------------------------------------------------------
+# Custom log curves (not natively available in colour-science)
+# ---------------------------------------------------------------------------
+
+def _gp_log_encoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, 0.0, None)
+    return np.where(
+        x < 0.005,
+        x * 8.0,
+        np.clip(0.325 * np.log2(x * 11.0 + 0.01) + 0.512, 0.0, 1.0)
+    )
+
+
+def _gp_log_decoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(
+        x < 0.04,
+        x / 8.0,
+        np.clip((np.power(2.0, (x - 0.512) / 0.325) - 0.01) / 11.0, 0.0, None)
+    )
+
+
+# Inject GP-Log into colour's LOG_ENCODINGS so it appears as a selectable profile
+if 'GP-Log' not in colour.models.LOG_ENCODINGS:
+    colour.models.LOG_ENCODINGS['GP-Log'] = _gp_log_encoding
+
+# Inject Rec709 / sRGB as pseudo log curves for sources that are already display-referred
+def _rec709_display_decoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.power(np.clip(x, 0.0, 1.0), 2.4)
+
+
+def _rec709_display_encoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.power(np.clip(x, 0.0, 1.0), 1.0 / 2.4)
+
+
+def _srgb_display_decoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.power(np.clip(x, 0.0, 1.0), 2.2)
+
+
+def _srgb_display_encoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.power(np.clip(x, 0.0, 1.0), 1.0 / 2.2)
+
+
+if 'Rec709 (No Log)' not in colour.models.LOG_ENCODINGS:
+    colour.models.LOG_ENCODINGS['Rec709 (No Log)'] = _rec709_display_encoding
+if 'sRGB (No Log)' not in colour.models.LOG_ENCODINGS:
+    colour.models.LOG_ENCODINGS['sRGB (No Log)'] = _srgb_display_encoding
+
+
+# ---------------------------------------------------------------------------
+# Display transform presets (for reference match mode)
+# Each entry: {'decode': fn(display→linear), 'encode': fn(linear→display)}
+# ---------------------------------------------------------------------------
+
+DISPLAY_TRANSFORMS = {}
+
+
+def _register_display_transform(name, decode_fn, encode_fn):
+    DISPLAY_TRANSFORMS[name] = {'decode': decode_fn, 'encode': encode_fn}
+
+
+def _decode_rec709(x):
+    return colour.models.oetf_inverse_BT709(np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0))
+
+
+def _encode_rec709(x):
+    return np.clip(colour.models.oetf_BT709(np.clip(np.asarray(x, dtype=np.float64), 0.0, 100.0)), 0.0, 1.0)
+
+
+def _decode_srgb(x):
+    return colour.models.eotf_sRGB(np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0))
+
+
+def _encode_srgb(x):
+    return np.clip(colour.models.eotf_inverse_sRGB(np.clip(np.asarray(x, dtype=np.float64), 0.0, 100.0)), 0.0, 1.0)
+
+
+def _decode_gamma24(x):
+    return np.power(np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0), 2.4)
+
+
+def _encode_gamma24(x):
+    return np.power(np.clip(np.asarray(x, dtype=np.float64), 0.0, 100.0), 1.0 / 2.4)
+
+
+def _decode_gamma22(x):
+    return np.power(np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0), 2.2)
+
+
+def _encode_gamma22(x):
+    return np.power(np.clip(np.asarray(x, dtype=np.float64), 0.0, 100.0), 1.0 / 2.2)
+
+
+_register_display_transform('Rec709 (BT.709)', _decode_rec709, _encode_rec709)
+_register_display_transform('sRGB', _decode_srgb, _encode_srgb)
+_register_display_transform('Gamma 2.4', _decode_gamma24, _encode_gamma24)
+_register_display_transform('Gamma 2.2', _decode_gamma22, _encode_gamma22)
+
+
+# ---------------------------------------------------------------------------
 # Image helpers
 # ---------------------------------------------------------------------------
 
@@ -114,6 +219,10 @@ def get_log_profiles() -> list:
     return sorted(list(colour.models.LOG_ENCODINGS.keys()))
 
 
+def get_display_gammas() -> list:
+    return sorted(DISPLAY_TRANSFORMS.keys())
+
+
 # ---------------------------------------------------------------------------
 # LUT generation
 # ---------------------------------------------------------------------------
@@ -178,3 +287,73 @@ def build_lut(
 
     colour.write_LUT(lut, output_path)
     return {"mse": mse, "output_file": output_path}
+
+
+def build_display_lut(
+    all_source_colors: np.ndarray,
+    all_target_colors: np.ndarray,
+    source_log_curve: str,
+    display_transform: str,
+    lut_name: str,
+    output_path: str,
+) -> dict:
+    """
+    Compute weighted least-squares color matrix for log→display matching
+    and bake into a 65^3 3D LUT whose output is display-referred.
+
+    all_source_colors  : patch samples from the source camera in log space
+    all_target_colors  : patch samples from the reference in display space
+    source_log_curve   : log curve name (e.g. 'V-Log', 'S-Log3')
+    display_transform  : display transform name (e.g. 'Rec709 (BT.709)', 'sRGB', 'Gamma 2.4')
+    """
+    xform = DISPLAY_TRANSFORMS.get(display_transform)
+    if xform is None:
+        raise ValueError(f"Unknown display transform: {display_transform}")
+
+    # 1. Decode source log → linear; decode target display → linear (using proper OETF inverse)
+    source_lin = _safe_log_decode(all_source_colors, source_log_curve)
+    target_lin = xform['decode'](all_target_colors)
+
+    # 2. Gray-patch weighting (indices 28-31 per 32-patch chunk)
+    weights = np.ones(len(source_lin))
+    gray_indices = {28, 29, 30, 31}
+    for i in range(len(source_lin)):
+        if (i % 32) in gray_indices:
+            weights[i] = 100.0
+    W = np.diag(weights)
+
+    # 3. Weighted least-squares with offset
+    source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
+    WX = W @ source_pad
+    WY = W @ target_lin
+    matrix, _, _, _ = np.linalg.lstsq(WX, WY, rcond=None)
+
+    source_transformed_lin = source_pad @ matrix
+    mse = float(np.mean((target_lin - source_transformed_lin) ** 2))
+
+    # 4. Bake into 65^3 LUT: source_log → display_transform
+    lut = colour.LUT3D(size=65, name=lut_name)
+    grid_lin = _safe_log_decode(lut.table, source_log_curve)
+
+    flat_grid_lin = grid_lin.reshape(-1, 3)
+    flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
+    flat_transformed_lin = flat_grid_pad @ matrix
+    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
+
+    flat_transformed_display = xform['encode'](flat_transformed_lin)
+    flat_transformed_display = np.clip(flat_transformed_display, 0.0, 1.0)
+
+    lut.table = flat_transformed_display.reshape((65, 65, 65, 3))
+    colour.write_LUT(lut, output_path)
+    return {"mse": mse, "output_file": output_path}
+
+
+def _safe_log_decode(values: np.ndarray, curve_name: str) -> np.ndarray:
+    """Decode log values to linear, falling back to gamma 2.4 on failure."""
+    try:
+        curve = colour.models.LOG_ENCODINGS.get(curve_name)
+        if curve is None and curve_name in colour.models.LOG_ENCODINGS:
+            curve = colour.models.LOG_ENCODINGS[curve_name]
+        return colour.models.log_decoding(values, function=curve_name)
+    except Exception:
+        return np.power(np.clip(values, 0.0, 1.0), 2.4)

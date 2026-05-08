@@ -1,9 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['webview', 'colour', 'cv2']
+hiddenimports = []
 hiddenimports += collect_submodules('colour')
-hiddenimports += collect_submodules('cv2')
 
 
 a = Analysis(
@@ -15,7 +14,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'pandas', 'scipy', 'IPython', 'PIL', 'tkinter', 'unittest', 'xmlrpc', 'email'],
+    excludes=['matplotlib', 'pandas', 'scipy', 'IPython', 'PIL', 'tkinter', 'xmlrpc'],
     noarchive=False,
     optimize=0,
 )
@@ -29,7 +28,7 @@ exe = EXE(
     name='Camera Match Lab',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=False,
     upx=True,
     console=False,
     disable_windowed_traceback=False,
@@ -43,7 +42,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    strip=True,
+    strip=False,
     upx=True,
     upx_exclude=[],
     name='Camera Match Lab',
@@ -52,5 +51,5 @@ app = BUNDLE(
     coll,
     name='Camera Match Lab.app',
     icon='icon.icns',
-    bundle_identifier=None,
+    bundle_identifier='com.cameramatchlab.app',
 )

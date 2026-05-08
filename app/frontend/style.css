@@ -376,6 +376,89 @@ a { color: inherit; text-decoration: none; }
 .master-add-wrap { display: flex; }
 .hidden { display: none !important; }
 
+/* Reference mode sections */
+.ref-section {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  margin-bottom: 8px;
+}
+.ref-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 14px;
+  letter-spacing: -0.2px;
+}
+.drop-slot-role.reference-label { background: rgba(200,169,110,0.18); color: var(--gold-light); }
+
+/* Gamma / Log item options in reference step 3 */
+.gamma-option, .log-item {
+  padding: 7px 12px;
+  font-size: 12.5px;
+  font-family: var(--mono);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.15s;
+  border-bottom: 1px solid var(--border);
+}
+.gamma-option:last-child, .log-item:last-child { border-bottom: none; }
+.gamma-option:hover, .log-item:hover { background: var(--bg-3); color: var(--text); }
+.gamma-option.selected, .log-item.selected { background: var(--gold-dim); color: var(--gold); font-weight: 700; }
+
+/* Reference mode inline controls (step 2) */
+.ref-gamma-box {
+  width: 220px;
+  min-width: 200px;
+  padding: 12px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
+.ref-source-controls {
+  width: 240px;
+  min-width: 200px;
+  padding: 10px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ref-select {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--font);
+  outline: none;
+}
+.ref-select:focus { border-color: var(--gold); }
+.ref-search { font-size: 11px; padding: 5px 8px; }
+.ref-delete-btn {
+  min-width: 32px;
+  height: 32px;
+  align-self: flex-start;
+  margin-top: 22px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--border-hover);
+  border-radius: var(--radius-sm);
+  color: var(--red);
+  cursor: pointer;
+  font-size: 14px;
+}
+.ref-delete-btn:hover { background: rgba(224,82,82,0.1); border-color: var(--red); }
+
 /* ================================================================
    STEP 3 – LOG PROFILES
    ================================================================ */
@@ -509,10 +592,12 @@ a { color: inherit; text-decoration: none; }
   cursor: crosshair;
 }
 .canvas-wrap img {
+  display: block;
+  position: absolute;
+  top: 0; left: 0;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  display: block;
   pointer-events: none;
 }
 .canvas-wrap canvas {
