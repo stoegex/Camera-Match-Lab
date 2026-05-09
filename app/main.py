@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import platform
 
 # When bundled by PyInstaller, __file__ lives inside the temp _MEIPASS folder.
 if getattr(sys, "frozen", False):
@@ -30,6 +31,18 @@ flask_app = create_app(frontend_dir=FRONTEND_DIR)
 _window = None
 
 
+def _get_lut_cache_dir() -> str:
+    """Same logic as server.py – resolve the cross-platform LUT cache dir."""
+    system = platform.system()
+    if system == "Darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Caches", "Camera Match Lab", "luts")
+    elif system == "Windows":
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "Camera Match Lab", "luts")
+    else:
+        return os.path.join(os.path.expanduser("~"), ".cache", "camera-match-lab", "luts")
+
+
 class PyWebViewApi:
     """Methods exposed to JavaScript via window.pywebview.api.*"""
 
@@ -44,28 +57,34 @@ class PyWebViewApi:
 
         result = _window.create_file_dialog(
             webview.SAVE_DIALOG,
-            directory=os.path.expanduser("~"),
+            directory=os.path.expanduser("~/Desktop"),
             save_filename=suggested_name,
             file_types=("CUBE LUT (*.cube)", "All files (*.*)",),
         )
         if not result:
             return {"success": False}  # user cancelled
 
-        dest_path = os.path.abspath(result[0])
+        # pywebview returns str on some platforms, tuple/list on others
+        dest_path = result if isinstance(result, str) else result[0]
+        dest_path = os.path.abspath(dest_path)
+
+        # Ensure .cube extension
+        if not dest_path.lower().endswith('.cube'):
+            dest_path += '.cube'
+
         dest_dir = os.path.dirname(dest_path)
 
-        # Guard: if the path resolves to filesystem root (macOS save dialog quirk),
-        # redirect to Desktop which is always writable.
-        if dest_dir == "/" or not os.access(dest_dir, os.W_OK):
-            fallback = os.path.join(os.path.expanduser("~"), "Desktop", os.path.basename(dest_path))
-            dest_path = fallback
-            dest_dir = os.path.dirname(dest_path)
+        # Guard: macOS save dialog can return root "/" or non-writable paths
+        if dest_dir in ("/", "") or not os.access(dest_dir, os.W_OK):
+            fallback_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+            dest_path = os.path.join(fallback_dir, os.path.basename(dest_path))
+            dest_dir = fallback_dir
             os.makedirs(dest_dir, exist_ok=True)
 
         if not os.access(dest_dir, os.W_OK):
             return {"success": False, "error": f"Verzeichnis nicht beschreibbar: {dest_dir}"}
 
-        cache_dir = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Camera Match Lab", "luts")
+        cache_dir = _get_lut_cache_dir()
         src_path = os.path.join(cache_dir, tmp_filename)
 
         if not os.path.isfile(src_path):
@@ -74,6 +93,38 @@ class PyWebViewApi:
         shutil.copy(src_path, dest_path)
         folder = os.path.dirname(dest_path)
         return {"success": True, "path": dest_path, "folder": folder}
+
+    def save_all_luts(self, lut_filenames: list) -> dict:
+        """
+        Opens a native Folder dialog ONCE and copies all LUTs into the chosen folder.
+        Returns {"success": True/False, "saved": [...], "folder": "..."}
+        """
+        if _window is None:
+            return {"success": False, "error": "No window"}
+
+        result = _window.create_file_dialog(
+            webview.FOLDER_DIALOG,
+            directory=os.path.expanduser("~/Desktop"),
+        )
+        if not result:
+            return {"success": False}  # user cancelled
+
+        dest_dir = result if isinstance(result, str) else result[0]
+        dest_dir = os.path.abspath(dest_dir)
+
+        if not os.path.isdir(dest_dir) or not os.access(dest_dir, os.W_OK):
+            return {"success": False, "error": f"Verzeichnis nicht beschreibbar: {dest_dir}"}
+
+        cache_dir = _get_lut_cache_dir()
+        saved = []
+        for filename in lut_filenames:
+            src = os.path.join(cache_dir, filename)
+            dst = os.path.join(dest_dir, filename)
+            if os.path.isfile(src):
+                shutil.copy(src, dst)
+                saved.append(dst)
+
+        return {"success": True, "saved": saved, "folder": dest_dir, "count": len(saved)}
 
     def open_folder(self, folder: str) -> dict:
         """Opens the folder in the OS file manager."""

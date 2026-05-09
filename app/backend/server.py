@@ -27,8 +27,20 @@ from .lut_engine import (
 import numpy as np
 
 
-# Persistent cache directory for LUT outputs (avoids errno 30 on system tempdir cleanup)
-OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Camera Match Lab", "luts")
+# Persistent cache directory for LUT outputs – cross-platform
+import platform as _platform
+
+def _get_cache_dir():
+    system = _platform.system()
+    if system == "Darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Caches", "Camera Match Lab", "luts")
+    elif system == "Windows":
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "Camera Match Lab", "luts")
+    else:  # Linux / other
+        return os.path.join(os.path.expanduser("~"), ".cache", "camera-match-lab", "luts")
+
+OUTPUT_DIR = _get_cache_dir()
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 

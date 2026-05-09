@@ -238,7 +238,7 @@ def _apply_display_decode_display_to_linear(ref_colors, transform_name):
     x = np.clip(ref_colors, 0.0, 1.0)
     if transform_name == 'Rec709 (BT.709)':
         return colour.models.oetf_inverse_BT709(x)
-    el    if transform_name == 'sRGB':
+    elif transform_name == 'sRGB':
         return colour.models.eotf_sRGB(x)
     elif transform_name == 'Gamma 2.4':
         return np.power(x, 2.4)

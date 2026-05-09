@@ -654,7 +654,7 @@ const App = (() => {
     if (cs) cs.corners = [];
 
     const label = type === 'reference' ? 'REFERENZ-Bild' : `SOURCE ${idx + 1}: ${state.sourceCameras[idx]?.name || ''}`;
-    $('step4Title').textContent = `${label} — Ecken markieren`;
+    $('step4Title').textContent = `${label} — Ecken markieren (${refCornerPos + 1}/${refCornerQueue.length})`;
     $('step4Next').disabled = true;
     state.currentCornerImg = imgId;
 
@@ -722,7 +722,7 @@ const App = (() => {
     }
     const { type, idx, warpedId, warpedSrc, defaultPatches } = refPatchQueue[refPatchPos];
     const label = type === 'reference' ? 'REFERENZ-Bild' : `SOURCE ${idx + 1}: ${state.sourceCameras[idx]?.name || ''}`;
-    $('step5Title').textContent = `${label} — Patches feinjustieren`;
+    $('step5Title').textContent = `${label} — Patches feinjustieren (${refPatchPos + 1}/${refPatchQueue.length})`;
     $('step5NextLabel').textContent = refPatchPos === refPatchQueue.length - 1 ? 'LUTs generieren →' : 'Weiter →';
 
     state.currentPatchWarpedId = warpedId;
@@ -777,7 +777,7 @@ const App = (() => {
 
     const roleName = role === 'source' ? 'Quell' : 'Ziel';
     const pairName = state.mode === 'master' ? ` (Paar ${pairIdx + 1})` : '';
-    $('step4Title').textContent = `${roleName}-Bild Ecken markieren${pairName}`;
+    $('step4Title').textContent = `${roleName}-Bild Ecken markieren${pairName} (${cornerQueuePos + 1}/${cornerQueue.length})`;
     $('step4Next').disabled = true;
     state.currentCornerImg = imgId;
 
@@ -799,21 +799,16 @@ const App = (() => {
       });
     };
     // Reset dot indicators
-    for (let i = 0; i < 4; i++) {
-      const d = $(`cdot${i}`);
-      d.classList.remove('set', 'active');
-      if (i === 0) d.classList.add('active');
-    }
+    _syncCornerDots(cs.corners.length);
 
-    canvas.onclick = (e) => {
-      if (cs.corners.length >= 4) return;
+    let draggingCorner = -1;
+
+    canvas.onmousedown = (e) => {
       const rect = canvas.getBoundingClientRect();
       const scaleX = canvas.width / rect.width;
       const scaleY = canvas.height / rect.height;
       const x = (e.clientX - rect.left) * scaleX;
       const y = (e.clientY - rect.top) * scaleY;
-
-      // Map canvas px → Normalized fraction (0.0 to 1.0) relative to image
       const imgEl = $('cornerImg');
       const rendered = getRenderedImageRect(imgEl);
       if (!rendered) return;
@@ -821,20 +816,60 @@ const App = (() => {
       const normX = (x - rendered.x) / rendered.rw;
       const normY = (y - rendered.y) / rendered.rh;
 
-      // Clamp to image edges
+      // If all 4 are set, check for drag
+      if (cs.corners.length === 4) {
+        let minD = 0.04; // threshold in normalized coords
+        cs.corners.forEach(([cx, cy], i) => {
+          const d = Math.hypot(cx - normX, cy - normY);
+          if (d < minD) { minD = d; draggingCorner = i; }
+        });
+        if (draggingCorner >= 0) return; // start drag, don't add new point
+      }
+
+      // Otherwise add new point
+      if (cs.corners.length >= 4) return;
       const cx = Math.max(0, Math.min(1, normX));
       const cy = Math.max(0, Math.min(1, normY));
-
       cs.corners.push([cx, cy]);
-
-      const idx = cs.corners.length - 1;
-      const d = $(`cdot${idx}`);
-      d.classList.replace('active', 'set');
-      if (idx < 3) $(`cdot${idx + 1}`)?.classList.add('active');
-
+      _syncCornerDots(cs.corners.length);
       if (cs.corners.length === 4) $('step4Next').disabled = false;
       drawCorners(canvas, cs.corners, rendered);
     };
+
+    canvas.onmousemove = (e) => {
+      if (draggingCorner < 0) return;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const x = (e.clientX - rect.left) * scaleX;
+      const y = (e.clientY - rect.top) * scaleY;
+      const imgEl = $('cornerImg');
+      const rendered = getRenderedImageRect(imgEl);
+      if (!rendered) return;
+      cs.corners[draggingCorner] = [
+        Math.max(0, Math.min(1, (x - rendered.x) / rendered.rw)),
+        Math.max(0, Math.min(1, (y - rendered.y) / rendered.rh)),
+      ];
+      drawCorners(canvas, cs.corners, rendered);
+    };
+
+    canvas.onmouseup = () => { draggingCorner = -1; };
+    canvas.onmouseleave = () => { draggingCorner = -1; };
+
+    // Right-click = undo last corner
+    canvas.oncontextmenu = (e) => {
+      e.preventDefault();
+      undoLastCorner();
+    };
+  }
+
+  function _syncCornerDots (count) {
+    for (let i = 0; i < 4; i++) {
+      const d = $(`cdot${i}`);
+      d.classList.remove('set', 'active');
+      if (i < count) d.classList.add('set');
+      else if (i === count) d.classList.add('active');
+    }
   }
 
   function getRenderedImageRect (imgEl) {
@@ -893,14 +928,20 @@ const App = (() => {
   function resetCorners () {
     const cs = state.cornerState[state.currentCornerImg];
     cs.corners = [];
-    for (let i = 0; i < 4; i++) {
-      const d = $(`cdot${i}`);
-      d.classList.remove('set', 'active');
-      if (i === 0) d.classList.add('active');
-    }
+    _syncCornerDots(0);
     $('step4Next').disabled = true;
     const canvas = $('cornerCanvas');
     canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function undoLastCorner () {
+    const cs = state.cornerState[state.currentCornerImg];
+    if (!cs || cs.corners.length === 0) return;
+    cs.corners.pop();
+    _syncCornerDots(cs.corners.length);
+    $('step4Next').disabled = cs.corners.length < 4;
+    const canvas = $('cornerCanvas');
+    drawCorners(canvas, cs.corners);
   }
 
   async function step4Next () {
@@ -971,7 +1012,7 @@ const App = (() => {
     const { pairIdx, role, warpedId, warpedSrc, defaultPatches } = patchQueue[patchQueuePos];
     const roleName = role === 'source' ? 'Quell' : 'Ziel';
     const pairName = state.mode === 'master' ? ` (Paar ${pairIdx + 1})` : '';
-    $('step5Title').textContent = `${roleName}-Bild Patches feinjustieren${pairName}`;
+    $('step5Title').textContent = `${roleName}-Bild Patches feinjustieren${pairName} (${patchQueuePos + 1}/${patchQueue.length})`;
 
     const isLast = patchQueuePos === patchQueue.length - 1;
     $('step5NextLabel').textContent = isLast ? 'LUT generieren →' : 'Weiter →';
@@ -1151,25 +1192,44 @@ const App = (() => {
     const btn = $('btnSaveAllLuts');
     if (!btn) return;
     btn.disabled = true;
-    btn.textContent = '⏳ Speichere…';
-    let saved = 0;
-    for (const r of _lastRefResults) {
-      try {
-        if (window.pywebview && window.pywebview.api) {
-          const result = await window.pywebview.api.save_lut(r.filename, r.filename);
-          if (result.success) saved++;
+    btn.textContent = '⏳ Ordner wählen…';
+
+    const filenames = _lastRefResults.map(r => r.filename);
+
+    try {
+      if (window.pywebview && window.pywebview.api) {
+        // Single folder dialog → all files saved at once
+        const result = await window.pywebview.api.save_all_luts(filenames);
+        if (result.success) {
+          btn.textContent = `✓ ${result.count}/${filenames.length} gespeichert`;
+          // Show open-folder button
+          const ofBtn = $('btnOpenFolder');
+          if (ofBtn && result.folder) {
+            ofBtn.dataset.folder = result.folder;
+            show(ofBtn);
+          }
         } else {
+          btn.disabled = false;
+          btn.textContent = '💾 Alle LUTs speichern';
+        }
+      } else {
+        // Dev mode fallback: trigger HTTP downloads
+        let saved = 0;
+        for (const r of _lastRefResults) {
           const a = document.createElement('a');
           a.href = `/api/download/${r.filename}`;
           a.download = r.filename;
           a.click();
           saved++;
-          await new Promise(r => setTimeout(r, 300));
+          await new Promise(resolve => setTimeout(resolve, 300));
         }
-      } catch (e) { console.error('Save failed', e); }
+        btn.textContent = `✓ ${saved}/${filenames.length} gespeichert`;
+      }
+    } catch (e) {
+      console.error('Save all failed', e);
+      btn.disabled = false;
+      btn.textContent = '💾 Alle LUTs speichern';
     }
-    btn.textContent = `✓ ${saved}/${_lastRefResults.length} gespeichert`;
-    btn.disabled = true;
   }
 
   async function generateLUT () {
@@ -1316,7 +1376,7 @@ const App = (() => {
     selectMode, goStep,
     step2Next, addMasterPair, _slotClick,
     filterLog, step3Next,
-    resetCorners, step4Next, cornerBack,
+    resetCorners, undoLastCorner, step4Next, cornerBack,
     resetPatches, step5Next, patchBack,
     saveLut, openFolder,
     addAnotherScene, restart,

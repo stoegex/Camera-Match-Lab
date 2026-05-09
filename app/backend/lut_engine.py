@@ -1,6 +1,10 @@
 """
 lut_engine.py – Pure calculation logic, no UI, no stdin.
-Extracted from generate_lut.py.
+
+Core algorithm: Root-Polynomial Color Correction (Finlayson 2015)
+instead of simple 3×3 linear matrix.  This yields exposure-invariant,
+non-linear colour matching that handles saturation roll-off and
+hue-shifts across luminance ranges far better than a linear fit.
 """
 import os
 import numpy as np
@@ -32,24 +36,15 @@ def _gp_log_decoding(x):
     )
 
 
-# Inject GP-Log into colour's LOG_ENCODINGS so it appears as a selectable profile
-if 'GP-Log' not in colour.models.LOG_ENCODINGS:
-    colour.models.LOG_ENCODINGS['GP-Log'] = _gp_log_encoding
-
-# Inject Rec709 / sRGB as pseudo log curves for sources that are already display-referred
-def _rec709_display_decoding(x):
-    x = np.asarray(x, dtype=np.float64)
-    return np.power(np.clip(x, 0.0, 1.0), 2.4)
-
-
+# Pseudo-log curves for sources that are already display-referred
 def _rec709_display_encoding(x):
     x = np.asarray(x, dtype=np.float64)
     return np.power(np.clip(x, 0.0, 1.0), 1.0 / 2.4)
 
 
-def _srgb_display_decoding(x):
+def _rec709_display_decoding(x):
     x = np.asarray(x, dtype=np.float64)
-    return np.power(np.clip(x, 0.0, 1.0), 2.2)
+    return np.power(np.clip(x, 0.0, 1.0), 2.4)
 
 
 def _srgb_display_encoding(x):
@@ -57,15 +52,30 @@ def _srgb_display_encoding(x):
     return np.power(np.clip(x, 0.0, 1.0), 1.0 / 2.2)
 
 
-if 'Rec709 (No Log)' not in colour.models.LOG_ENCODINGS:
-    colour.models.LOG_ENCODINGS['Rec709 (No Log)'] = _rec709_display_encoding
-if 'sRGB (No Log)' not in colour.models.LOG_ENCODINGS:
-    colour.models.LOG_ENCODINGS['sRGB (No Log)'] = _srgb_display_encoding
+def _srgb_display_decoding(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.power(np.clip(x, 0.0, 1.0), 2.2)
+
+
+# ---------------------------------------------------------------------------
+# Reliable custom curve registry (avoids LOG_ENCODINGS / LOG_DECODINGS
+# confusion across different colour-science versions)
+# ---------------------------------------------------------------------------
+
+CUSTOM_LOG_CURVES = {
+    'GP-Log':          {'encode': _gp_log_encoding,        'decode': _gp_log_decoding},
+    'Rec709 (No Log)': {'encode': _rec709_display_encoding, 'decode': _rec709_display_decoding},
+    'sRGB (No Log)':   {'encode': _srgb_display_encoding,   'decode': _srgb_display_decoding},
+}
+
+# Register encoding side so the names appear in get_log_profiles()
+for _name, _fns in CUSTOM_LOG_CURVES.items():
+    if _name not in colour.models.LOG_ENCODINGS:
+        colour.models.LOG_ENCODINGS[_name] = _fns['encode']
 
 
 # ---------------------------------------------------------------------------
 # Display transform presets (for reference match mode)
-# Each entry: {'decode': fn(display→linear), 'encode': fn(linear→display)}
 # ---------------------------------------------------------------------------
 
 DISPLAY_TRANSFORMS = {}
@@ -224,8 +234,113 @@ def get_display_gammas() -> list:
 
 
 # ---------------------------------------------------------------------------
+# Safe log decode / encode  (handles custom curves + fallback)
+# ---------------------------------------------------------------------------
+
+def _safe_log_decode(values: np.ndarray, curve_name: str) -> np.ndarray:
+    """Decode log values to linear, using custom registry first, then colour-science."""
+    if curve_name in CUSTOM_LOG_CURVES:
+        return CUSTOM_LOG_CURVES[curve_name]['decode'](values)
+    try:
+        return colour.models.log_decoding(values, function=curve_name)
+    except Exception:
+        return np.power(np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0), 2.4)
+
+
+def _safe_log_encode(values: np.ndarray, curve_name: str) -> np.ndarray:
+    """Encode linear values to log, using custom registry first, then colour-science."""
+    if curve_name in CUSTOM_LOG_CURVES:
+        return CUSTOM_LOG_CURVES[curve_name]['encode'](values)
+    try:
+        return colour.models.log_encoding(values, function=curve_name)
+    except Exception:
+        return np.power(np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0), 1.0 / 2.4)
+
+
+# ---------------------------------------------------------------------------
+# Root-Polynomial Color Correction  (Finlayson et al. 2015)
+#
+# Instead of a simple 3×3+offset linear matrix, this expands the input RGB
+# into a higher-dimensional space using root-polynomial terms:
+#   degree 1: [R, G, B, 1]                          →  4 terms (= old approach)
+#   degree 2: [R, G, B, √(RG), √(RB), √(GB), 1]    →  7 terms (default)
+#
+# Key property: *exposure-invariant* — all terms scale linearly with scene
+# irradiance, so the correction matrix stays valid across different exposures.
+# ---------------------------------------------------------------------------
+
+def _root_polynomial_expand(RGB: np.ndarray, degree: int = 2) -> np.ndarray:
+    """
+    Expand RGB into root-polynomial basis (Finlayson 2015).
+    Returns array with extra columns; offset column (1.0) added separately.
+    """
+    RGB = np.asarray(RGB, dtype=np.float64)
+    R, G, B = RGB[..., 0], RGB[..., 1], RGB[..., 2]
+
+    if degree <= 1:
+        return np.stack([R, G, B], axis=-1)
+
+    # Degree 2: add cross-channel root terms
+    # np.abs prevents NaN from negative values after log decoding edge cases
+    RG = np.sqrt(np.abs(R * G))
+    RB = np.sqrt(np.abs(R * B))
+    GB = np.sqrt(np.abs(G * B))
+    return np.stack([R, G, B, RG, RB, GB], axis=-1)
+
+
+def _weight_gray_patches(source: np.ndarray, target: np.ndarray,
+                         weight: int = 10) -> tuple:
+    """
+    Amplify gray-patch influence by duplicating them.
+    Gray patches are at indices 28-31 in each 32-patch chunk.
+    This replaces the old np.diag(weights) approach which created
+    an N×N matrix and didn't scale for Master-mode.
+    """
+    gray_indices = {28, 29, 30, 31}
+    extra_s, extra_t = [], []
+    for i in range(len(source)):
+        if (i % 32) in gray_indices:
+            for _ in range(weight - 1):  # original already counts once
+                extra_s.append(source[i])
+                extra_t.append(target[i])
+    if extra_s:
+        source = np.vstack([source, np.array(extra_s)])
+        target = np.vstack([target, np.array(extra_t)])
+    return source, target
+
+
+def _compute_correction_matrix(source_lin: np.ndarray, target_lin: np.ndarray,
+                               degree: int = 2, gray_weight: int = 10) -> np.ndarray:
+    """
+    Compute the root-polynomial correction matrix.
+    Returns shape (terms+1, 3) matrix  (last row = offset).
+    """
+    src_w, tgt_w = _weight_gray_patches(source_lin, target_lin, gray_weight)
+    src_w = np.clip(src_w, 1e-6, None)
+
+    expanded = _root_polynomial_expand(src_w, degree=degree)
+    # Add offset column (constant 1.0)
+    expanded_pad = np.c_[expanded, np.ones(expanded.shape[0])]
+
+    matrix, _, _, _ = np.linalg.lstsq(expanded_pad, tgt_w, rcond=None)
+    return matrix
+
+
+def _apply_correction(rgb_linear: np.ndarray, matrix: np.ndarray,
+                      degree: int = 2) -> np.ndarray:
+    """Apply pre-computed root-polynomial correction matrix."""
+    rgb_clipped = np.clip(rgb_linear, 1e-6, None)
+    expanded = _root_polynomial_expand(rgb_clipped, degree=degree)
+    expanded_pad = np.c_[expanded, np.ones(expanded.shape[0])]
+    return expanded_pad @ matrix
+
+
+# ---------------------------------------------------------------------------
 # LUT generation
 # ---------------------------------------------------------------------------
+
+_POLY_DEGREE = 2   # configurable: 1 = old linear, 2 = root-polynomial (recommended)
+
 
 def build_lut(
     all_source_colors: np.ndarray,
@@ -236,55 +351,32 @@ def build_lut(
     output_path: str,
 ) -> dict:
     """
-    Compute weighted least-squares color matrix and bake into a 65^3 3D LUT.
-
-    Returns dict with keys: mse, output_file
+    Compute root-polynomial color correction and bake into a 65³ 3D LUT.
+    Source and target are both in log space; output LUT maps source_log → target_log.
     """
     # 1. Log → Linear
-    try:
-        source_lin = colour.models.log_decoding(all_source_colors, function=source_log_curve)
-        target_lin = colour.models.log_decoding(all_target_colors, function=target_log_curve)
-    except Exception as e:
-        source_lin = np.power(np.clip(all_source_colors, 0, 1), 2.4)
-        target_lin = np.power(np.clip(all_target_colors, 0, 1), 2.4)
+    source_lin = _safe_log_decode(all_source_colors, source_log_curve)
+    target_lin = _safe_log_decode(all_target_colors, target_log_curve)
 
-    # 2. Gray-patch weighting (indices 28-31 per 32-patch chunk)
-    weights = np.ones(len(source_lin))
-    gray_indices = {28, 29, 30, 31}
-    for i in range(len(source_lin)):
-        if (i % 32) in gray_indices:
-            weights[i] = 100.0
-    W = np.diag(weights)
+    # 2. Compute correction matrix (root-polynomial, exposure-invariant)
+    matrix = _compute_correction_matrix(source_lin, target_lin, degree=_POLY_DEGREE)
 
-    # 3. Weighted least-squares: solve [source_lin | 1] @ matrix ≈ target_lin
-    source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
-    WX = W @ source_pad
-    WY = W @ target_lin
-    matrix, _, _, _ = np.linalg.lstsq(WX, WY, rcond=None)
+    # 3. Measure accuracy on training patches
+    corrected = _apply_correction(source_lin, matrix, degree=_POLY_DEGREE)
+    mse = float(np.mean((target_lin - corrected) ** 2))
 
-    source_transformed_lin = source_pad @ matrix
-    mse = float(np.mean((target_lin - source_transformed_lin) ** 2))
-
-    # 4. Bake into 65^3 LUT
+    # 4. Bake into 65³ LUT
     lut = colour.LUT3D(size=65, name=lut_name)
-    try:
-        grid_lin = colour.models.log_decoding(lut.table, function=source_log_curve)
-    except Exception:
-        grid_lin = np.power(np.clip(lut.table, 0, 1), 2.4)
-
+    grid_lin = _safe_log_decode(lut.table, source_log_curve)
     flat_grid_lin = grid_lin.reshape(-1, 3)
-    flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
-    flat_transformed_lin = flat_grid_pad @ matrix
+
+    flat_transformed_lin = _apply_correction(flat_grid_lin, matrix, degree=_POLY_DEGREE)
     flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
 
-    try:
-        flat_transformed_log = colour.models.log_encoding(flat_transformed_lin, function=target_log_curve)
-    except Exception:
-        flat_transformed_log = np.power(flat_transformed_lin, 1 / 2.4)
-
+    flat_transformed_log = _safe_log_encode(flat_transformed_lin, target_log_curve)
     flat_transformed_log = np.clip(flat_transformed_log, 0.0, 1.0)
-    lut.table = flat_transformed_log.reshape((65, 65, 65, 3))
 
+    lut.table = flat_transformed_log.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
     return {"mse": mse, "output_file": output_path}
 
@@ -298,46 +390,30 @@ def build_display_lut(
     output_path: str,
 ) -> dict:
     """
-    Compute weighted least-squares color matrix for log→display matching
-    and bake into a 65^3 3D LUT whose output is display-referred.
-
-    all_source_colors  : patch samples from the source camera in log space
-    all_target_colors  : patch samples from the reference in display space
-    source_log_curve   : log curve name (e.g. 'V-Log', 'S-Log3')
-    display_transform  : display transform name (e.g. 'Rec709 (BT.709)', 'sRGB', 'Gamma 2.4')
+    Compute root-polynomial color correction for log→display matching
+    and bake into a 65³ 3D LUT whose output is display-referred.
     """
     xform = DISPLAY_TRANSFORMS.get(display_transform)
     if xform is None:
         raise ValueError(f"Unknown display transform: {display_transform}")
 
-    # 1. Decode source log → linear; decode target display → linear (using proper OETF inverse)
+    # 1. Decode source log → linear; decode target display → linear
     source_lin = _safe_log_decode(all_source_colors, source_log_curve)
     target_lin = xform['decode'](all_target_colors)
 
-    # 2. Gray-patch weighting (indices 28-31 per 32-patch chunk)
-    weights = np.ones(len(source_lin))
-    gray_indices = {28, 29, 30, 31}
-    for i in range(len(source_lin)):
-        if (i % 32) in gray_indices:
-            weights[i] = 100.0
-    W = np.diag(weights)
+    # 2. Compute correction matrix
+    matrix = _compute_correction_matrix(source_lin, target_lin, degree=_POLY_DEGREE)
 
-    # 3. Weighted least-squares with offset
-    source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
-    WX = W @ source_pad
-    WY = W @ target_lin
-    matrix, _, _, _ = np.linalg.lstsq(WX, WY, rcond=None)
+    # 3. Measure accuracy
+    corrected = _apply_correction(source_lin, matrix, degree=_POLY_DEGREE)
+    mse = float(np.mean((target_lin - corrected) ** 2))
 
-    source_transformed_lin = source_pad @ matrix
-    mse = float(np.mean((target_lin - source_transformed_lin) ** 2))
-
-    # 4. Bake into 65^3 LUT: source_log → display_transform
+    # 4. Bake into 65³ LUT: source_log → display
     lut = colour.LUT3D(size=65, name=lut_name)
     grid_lin = _safe_log_decode(lut.table, source_log_curve)
-
     flat_grid_lin = grid_lin.reshape(-1, 3)
-    flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
-    flat_transformed_lin = flat_grid_pad @ matrix
+
+    flat_transformed_lin = _apply_correction(flat_grid_lin, matrix, degree=_POLY_DEGREE)
     flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
 
     flat_transformed_display = xform['encode'](flat_transformed_lin)
@@ -346,14 +422,3 @@ def build_display_lut(
     lut.table = flat_transformed_display.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
     return {"mse": mse, "output_file": output_path}
-
-
-def _safe_log_decode(values: np.ndarray, curve_name: str) -> np.ndarray:
-    """Decode log values to linear, falling back to gamma 2.4 on failure."""
-    try:
-        curve = colour.models.LOG_ENCODINGS.get(curve_name)
-        if curve is None and curve_name in colour.models.LOG_ENCODINGS:
-            curve = colour.models.LOG_ENCODINGS[curve_name]
-        return colour.models.log_decoding(values, function=curve_name)
-    except Exception:
-        return np.power(np.clip(values, 0.0, 1.0), 2.4)
