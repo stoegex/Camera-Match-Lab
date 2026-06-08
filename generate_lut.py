@@ -191,6 +191,9 @@ def select_files(files, source_only=False):
 def select_log_profiles():
     import colour
     available_curves = sorted(list(colour.models.LOG_ENCODINGS.keys()))
+    if "GP-Log2" not in available_curves:
+        available_curves.append("GP-Log2")
+        available_curves.sort()
     
     print("\nVerfuegbare Kamera Log-Profile:")
     for i, curve in enumerate(available_curves):
@@ -267,6 +270,9 @@ def _apply_display_encode_linear_to_display(linear, transform_name):
 def select_source_log_profile():
     import colour
     available_curves = sorted(list(colour.models.LOG_ENCODINGS.keys()))
+    if "GP-Log2" not in available_curves:
+        available_curves.append("GP-Log2")
+        available_curves.sort()
 
     print("\nVerfuegbare Kamera Log-Profile:")
     for i, curve in enumerate(available_curves):
@@ -347,41 +353,69 @@ def run_reference_match_mode():
         lut_name = f"{src_name}_to_{ref_name}_DisplayMatch"
         out_filename = get_unique_filename(lut_name)
 
-        print(f"\nBerechne 3x3 Matrix + 65^3 LUT: {source_log} -> {display_transform} ...")
+        print(f"\nBerechne Root-Polynomial Matrix + 65^3 LUT: {source_log} -> {display_transform} ...")
 
         try:
-            source_lin = colour.models.log_decoding(src_colors, function=source_log)
+            if source_log == "GP-Log2":
+                source_lin = (np.power(600.0, np.clip(src_colors, 0.0, 1.0)) - 1.0) / 599.0
+            else:
+                source_lin = colour.models.log_decoding(src_colors, function=source_log)
         except Exception as e:
             print(f"Warnung: Log Decoding fehlgeschlagen ({e}). Nutze Gamma 2.4 Fallback.")
             source_lin = np.power(np.clip(src_colors, 0, 1), 2.4)
 
         ref_lin = _apply_display_decode_display_to_linear(ref_colors, display_transform)
 
-        weights = np.ones(len(source_lin))
+        # Black-point normalization
+        source_lin64 = np.asarray(source_lin, dtype=np.float64)
+        ref_lin64 = np.asarray(ref_lin, dtype=np.float64)
+        src_black = float(np.percentile(source_lin64, 5))
+        tgt_black = float(np.percentile(ref_lin64, 5))
+        source_norm = np.maximum(source_lin64 - src_black, 0.0)
+        ref_norm = np.maximum(ref_lin64 - tgt_black, 0.0)
+
+        # Root-polynomial expansion without offset: [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)]
+        r, g, b = source_norm[:, 0:1], source_norm[:, 1:2], source_norm[:, 2:3]
+        source_expanded = np.hstack([r, g, b,
+            np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
+
+        # Weighted least squares: duplicate gray patches 10x
         gray_indices = [28, 29, 30, 31]
-        for i in range(len(source_lin)):
+        extra_s, extra_t = [], []
+        for i in range(len(source_expanded)):
             if (i % 32) in gray_indices:
-                weights[i] = 100.0
-        W = np.diag(weights)
+                for _ in range(9):
+                    extra_s.append(source_expanded[i])
+                    extra_t.append(ref_norm[i])
+        if extra_s:
+            source_expanded = np.vstack([source_expanded, np.array(extra_s)])
+            ref_norm = np.vstack([ref_norm, np.array(extra_t)])
 
-        source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
-        WX = np.dot(W, source_pad)
-        WY = np.dot(W, ref_lin)
-        matrix, residuals, rank, s = np.linalg.lstsq(WX, WY, rcond=None)
+        matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, ref_norm, rcond=None)
 
-        source_transformed_lin = np.dot(source_pad, matrix)
-        mse = np.mean((ref_lin - source_transformed_lin) ** 2)
+        # Measure accuracy on original patches
+        orig_expanded = np.hstack([r, g, b,
+            np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
+        predicted = np.dot(orig_expanded, matrix)
+        mse = np.mean((ref_norm[:len(predicted)] - predicted) ** 2)
         print(f"Abweichung (MSE im Linear-Space): {mse:.6f}")
 
         lut = colour.LUT3D(size=65, name=lut_name)
         try:
-            grid_lin = colour.models.log_decoding(lut.table, function=source_log)
+            if source_log == "GP-Log2":
+                grid_lin = (np.power(600.0, np.clip(lut.table, 0.0, 1.0)) - 1.0) / 599.0
+            else:
+                grid_lin = colour.models.log_decoding(lut.table, function=source_log)
         except Exception:
             grid_lin = np.power(np.clip(lut.table, 0, 1), 2.4)
 
         flat_grid_lin = grid_lin.reshape(-1, 3)
-        flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
-        flat_transformed_lin = np.dot(flat_grid_pad, matrix)
+        flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
+        gr, gg, gb = flat_grid_norm[:, 0:1], flat_grid_norm[:, 1:2], flat_grid_norm[:, 2:3]
+        flat_grid_expanded = np.hstack([gr, gg, gb,
+            np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
+        flat_transformed_lin = np.dot(flat_grid_expanded, matrix)
+        flat_transformed_lin = np.maximum(flat_transformed_lin + tgt_black, 1e-6)
         flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
 
         flat_transformed_display = _apply_display_encode_linear_to_display(flat_transformed_lin, display_transform)
@@ -506,67 +540,94 @@ def main():
         all_source_colors = s_colors
         all_target_colors = t_colors
         
-    print("\nBerechne professionelle 3x3 Matrix + Offset Optimierung (Linear Space)...")
+    print("\nBerechne Root-Polynomial Matrix + Offset Optimierung (Linear Space)...")
     
     # 1. LOG TO LINEAR CONVERSION
     try:
-        source_lin = colour.models.log_decoding(all_source_colors, function=source_log_curve)
-        target_lin = colour.models.log_decoding(all_target_colors, function=target_log_curve)
+        if source_log_curve == "GP-Log2":
+            source_lin = (np.power(600.0, np.clip(all_source_colors, 0.0, 1.0)) - 1.0) / 599.0
+        else:
+            source_lin = colour.models.log_decoding(all_source_colors, function=source_log_curve)
+            
+        if target_log_curve == "GP-Log2":
+            target_lin = (np.power(600.0, np.clip(all_target_colors, 0.0, 1.0)) - 1.0) / 599.0
+        else:
+            target_lin = colour.models.log_decoding(all_target_colors, function=target_log_curve)
     except Exception as e:
         print(f"Warnung: Natives Log Decoding fehlgeschlagen ({e}). Nutze Gamma 2.4 Fallback.")
         source_lin = np.power(np.clip(all_source_colors, 0, 1), 2.4)
         target_lin = np.power(np.clip(all_target_colors, 0, 1), 2.4)
     
-    # 2. GEWICHTUNG DER GRAUBLOECKE (Zwingt die Matrix, Schwarzwert/Weissabgleich sauber zu halten)
-    # Die Indizes der 4 grossen Bloecke im ColorChecker Video sind 28, 29, 30 und 31.
-    weights = np.ones(len(source_lin))
+    # 1b. BLACK-POINT NORMALIZATION – ensures black maps to black
+    source_lin64 = np.asarray(source_lin, dtype=np.float64)
+    target_lin64 = np.asarray(target_lin, dtype=np.float64)
+    src_black = float(np.percentile(source_lin64, 5))
+    tgt_black = float(np.percentile(target_lin64, 5))
+    source_norm = np.maximum(source_lin64 - src_black, 0.0)
+    target_norm = np.maximum(target_lin64 - tgt_black, 0.0)
+    print(f"Black-Point: Source={src_black:.6f} Target={tgt_black:.6f}")
+    
+    # 2. ROOT-POLYNOMIAL EXPANSION (Finlayson 2015) – without offset
+    # [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)] → 6 terms, no all-ones column
+    r, g, b = source_norm[:, 0:1], source_norm[:, 1:2], source_norm[:, 2:3]
+    source_expanded = np.hstack([r, g, b,
+        np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
+
+    # 3. GEWICHTUNG DER GRAUBLOECKE (duplicate gray patches 10x)
     gray_indices = [28, 29, 30, 31]
-    
-    # Falls wir im Master-Mode sind (mehrere Charts uebereinander), iterieren wir durch alle Chunks
-    for i in range(len(source_lin)):
+    extra_s, extra_t = [], []
+    for i in range(len(source_expanded)):
         if (i % 32) in gray_indices:
-            weights[i] = 100.0  # 100-fache Gewichtung fuer Grautoene!
-            
-    W = np.diag(weights)
+            for _ in range(9):
+                extra_s.append(source_expanded[i])
+                extra_t.append(target_norm[i])
+    if extra_s:
+        source_expanded = np.vstack([source_expanded, np.array(extra_s)])
+        target_norm = np.vstack([target_norm, np.array(extra_t)])
     
-    # 3. MATRIX KALKULATION (3x3 Matrix + Offset = 4x3)
-    # Fuegt eine Spalte mit Einsen (1.0) hinzu, damit die Matrix Belichtungs-/Flare-Offsets verrechnen kann
-    source_pad = np.c_[source_lin, np.ones(source_lin.shape[0])]
+    # 4. MATRIX KALKULATION (6x3 Root-Polynomial, no offset)
+    matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, target_norm, rcond=None)
     
-    WX = np.dot(W, source_pad)
-    WY = np.dot(W, target_lin)
-    
-    # Loest das Matrix-Problem nach Industriestandard (Least Squares)
-    matrix, residuals, rank, s = np.linalg.lstsq(WX, WY, rcond=None)
-    
-    source_transformed_lin = np.dot(source_pad, matrix)
-    mse = np.mean((target_lin - source_transformed_lin)**2)
+    # Measure accuracy on original patches
+    orig_expanded = np.hstack([r, g, b,
+        np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
+    predicted = np.dot(orig_expanded, matrix)
+    mse = np.mean((target_norm[:len(predicted)] - predicted)**2)
     print(f"Abweichung (MSE im Linear-Space): {mse:.6f}")
     
     print("\nGeneriere die artefaktfreie 65x65 3D-LUT...")
     lut = colour.LUT3D(size=65, name=lut_name)
     
     try:
-        grid_lin = colour.models.log_decoding(lut.table, function=source_log_curve)
+        if source_log_curve == "GP-Log2":
+            grid_lin = (np.power(600.0, np.clip(lut.table, 0.0, 1.0)) - 1.0) / 599.0
+        else:
+            grid_lin = colour.models.log_decoding(lut.table, function=source_log_curve)
     except Exception:
         grid_lin = np.power(lut.table, 2.4)
     
     flat_grid_lin = grid_lin.reshape(-1, 3)
     
-    # Das Gitter mit dem Offset-Parameter (1.0) versehen und die Matrix anwenden
-    flat_grid_pad = np.c_[flat_grid_lin, np.ones(flat_grid_lin.shape[0])]
-    flat_transformed_lin = np.dot(flat_grid_pad, matrix)
-    
-    # SICHERHEITS-CLIPPING IM LINEAR-SPACE (Verhindert NaN-Werte beim Log-Encoding durch extremes Schwarz)
-    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0) 
+    # Normalize grid with same black point, expand, apply matrix, denormalize
+    flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
+    gr, gg, gb = flat_grid_norm[:, 0:1], flat_grid_norm[:, 1:2], flat_grid_norm[:, 2:3]
+    flat_grid_expanded = np.hstack([gr, gg, gb,
+        np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
+    flat_transformed_lin = np.dot(flat_grid_expanded, matrix)
+    flat_transformed_lin = np.maximum(flat_transformed_lin + tgt_black, 1e-6)
+    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
     
     # ZURUECK IN DEN ZIEL-LOG (z.B. V-Log)
     try:
-        flat_transformed_log = colour.models.log_encoding(flat_transformed_lin, function=target_log_curve)
+        if target_log_curve == "GP-Log2":
+            lin_clipped = np.clip(flat_transformed_lin, 0.0, None)
+            flat_transformed_log = np.log(lin_clipped * 599.0 + 1.0) / np.log(600.0)
+        else:
+            flat_transformed_log = colour.models.log_encoding(flat_transformed_lin, function=target_log_curve)
     except Exception:
         flat_transformed_log = np.power(flat_transformed_lin, 1/2.4)
         
-    # Absolutes LUT-Clipping (Resolve erwartet 0.0 bis 1.0 in der Cube)
+    # Absolutes LUT-Clipping
     flat_transformed_log = np.clip(flat_transformed_log, 0.0, 1.0)
     
     lut.table = flat_transformed_log.reshape((65, 65, 65, 3))

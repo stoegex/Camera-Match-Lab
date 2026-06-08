@@ -36,6 +36,25 @@ def _gp_log_decoding(x):
     )
 
 
+def _gp_log2_encoding(x):
+    """
+    Encode linear Rec.2020 values using GoPro's documented Log Base 600 curve.
+
+    Reference:
+    https://gopro.github.io/labs/log/
+    """
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, 0.0, None)
+    return np.log(x * 599.0 + 1.0) / np.log(600.0)
+
+
+def _gp_log2_decoding(x):
+    """Decode GP-Log2 code values to linear Rec.2020 values."""
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, 0.0, 1.0)
+    return (np.power(600.0, x) - 1.0) / 599.0
+
+
 # Pseudo-log curves for sources that are already display-referred
 def _rec709_display_encoding(x):
     x = np.asarray(x, dtype=np.float64)
@@ -64,6 +83,7 @@ def _srgb_display_decoding(x):
 
 CUSTOM_LOG_CURVES = {
     'GP-Log':          {'encode': _gp_log_encoding,        'decode': _gp_log_decoding},
+    'GP-Log2':         {'encode': _gp_log2_encoding,       'decode': _gp_log2_decoding},
     'Rec709 (No Log)': {'encode': _rec709_display_encoding, 'decode': _rec709_display_decoding},
     'sRGB (No Log)':   {'encode': _srgb_display_encoding,   'decode': _srgb_display_decoding},
 }
@@ -155,8 +175,108 @@ def image_to_jpeg_bytes(img_uint8_bgr: np.ndarray, quality: int = 85) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# ColorChecker extraction
+# ColorChecker auto-detection
 # ---------------------------------------------------------------------------
+
+def detect_colorchecker(img_float_bgr: np.ndarray) -> list | None:
+    """
+    Auto-detect ColorChecker chart corners in the image.
+
+    Uses local color-variance scanning to find the chart region, then Hough
+    line detection to refine the grid boundaries.
+
+    Returns:
+        list of [[x,y]*4] normalized corners (TL,TR,BR,BL) or None on failure.
+    """
+    h, w = img_float_bgr.shape[:2]
+    if h < 100 or w < 100:
+        return None
+
+    # 1. Downsample for speed
+    target_w = 1200
+    scale = min(target_w / w, 1.0)
+    small = cv2.resize(img_float_bgr, (int(w * scale), int(h * scale)))
+    sh, sw = small.shape[:2]
+    rgb_small = small[:, :, ::-1]  # BGR → RGB    (already float 0-1)
+
+    # 2. Local colour variance – the chart grid has high variance
+    ksize = 15
+    sq_sum = cv2.blur(rgb_small ** 2, (ksize, ksize), borderType=cv2.BORDER_REPLICATE)
+    mean_sum = cv2.blur(rgb_small, (ksize, ksize), borderType=cv2.BORDER_REPLICATE)
+    local_var = (sq_sum[:, :, 0] - mean_sum[:, :, 0] ** 2 +
+                 sq_sum[:, :, 1] - mean_sum[:, :, 1] ** 2 +
+                 sq_sum[:, :, 2] - mean_sum[:, :, 2] ** 2) / 3.0
+
+    # 3. Scan for window with maximum total variance
+    win_w = int(sw * 0.45)
+    win_h = int(sh * 0.60)
+    step = int(min(win_w, win_h) * 0.12)
+    best, best_y, best_x = 0.0, 0, 0
+    for y in range(0, sh - win_h, step):
+        for x in range(0, sw - win_w, step):
+            score = float(local_var[y:y + win_h, x:x + win_w].sum())
+            if score > best:
+                best, best_y, best_x = score, y, x
+
+    # 4. Try Hough line refinement within the best window
+    margin = int(max(win_w, win_h) * 0.25)
+    ry1 = max(0, best_y - margin)
+    ry2 = min(sh, best_y + win_h + margin)
+    rx1 = max(0, best_x - margin)
+    rx2 = min(sw, best_x + win_w + margin)
+
+    gray_region = (rgb_small[ry1:ry2, rx1:rx2, :].mean(axis=2) * 255).astype(np.uint8)
+    corners_norm = None
+
+    for low_t in (25, 45, 70):
+        edges = cv2.Canny(gray_region, low_t, low_t * 3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                                minLineLength=40, maxLineGap=30)
+        if lines is None:
+            continue
+
+        h_vals, v_vals = [], []
+        for line in lines:
+            x1_l, y1_l, x2_l, y2_l = line[0]
+            dx, dy = abs(x2_l - x1_l), abs(y2_l - y1_l)
+            if dx + dy < 15:
+                continue
+            if dx > dy * 3.0:
+                h_vals.extend([y1_l, y2_l])
+            elif dy > dx * 3.0:
+                v_vals.extend([x1_l, x2_l])
+
+        if len(h_vals) < 6 or len(v_vals) < 3:
+            continue
+
+        hv, vv = np.array(h_vals), np.array(v_vals)
+        top_l = ry1 + float(np.percentile(hv, 3))
+        bot_l = ry1 + float(np.percentile(hv, 97))
+        left_l = rx1 + float(np.percentile(vv, 3))
+        right_l = rx1 + float(np.percentile(vv, 97))
+
+        aspect = (right_l - left_l) / max(bot_l - top_l, 1)
+        if 0.25 < aspect < 1.6 and (right_l - left_l) > sw * 0.08:
+            corners_norm = [
+                [left_l / sw, top_l / sh],
+                [right_l / sw, top_l / sh],
+                [right_l / sw, bot_l / sh],
+                [left_l / sw, bot_l / sh],
+            ]
+            break
+
+    # 5. Fallback – use the variance window with a 5 % inset
+    if corners_norm is None:
+        inset = 0.05
+        left = (best_x + win_w * inset) / sw
+        right = (best_x + win_w * (1 - inset)) / sw
+        top = (best_y + win_h * inset) / sh
+        bottom = (best_y + win_h * (1 - inset)) / sh
+        corners_norm = [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+    # 6. Remap coordinates back to original image (the down-sampled coords are
+    #    already normalized to 0-1, so they work for the original image too)
+    return [[float(x), float(y)] for x, y in corners_norm]
 
 # Default patch center positions (fractional, for a 600×400 warped rectangle)
 # ColorChecker Video layout: 4 columns × 7 rows outer + 4 large gray blocks
@@ -269,23 +389,37 @@ def _safe_log_encode(values: np.ndarray, curve_name: str) -> np.ndarray:
 # irradiance, so the correction matrix stays valid across different exposures.
 # ---------------------------------------------------------------------------
 
-def _root_polynomial_expand(RGB: np.ndarray, degree: int = 2) -> np.ndarray:
+def _apply_idw_interpolation(source_lin: np.ndarray, target_lin: np.ndarray, grid_lin: np.ndarray, gray_weight: int = 10, p: float = 2.0) -> np.ndarray:
     """
-    Expand RGB into root-polynomial basis (Finlayson 2015).
-    Returns array with extra columns; offset column (1.0) added separately.
+    1. Base mapping is Identity (no 3x3 matrix) to prevent non-linear color flipping (blue/dark issues).
+    2. Calculates exact residual vectors for each patch.
+    3. Uses Inverse Distance Weighting (IDW) to smoothly interpolate residuals across the grid.
+    Returns the transformed grid in empirical RGB space.
     """
-    RGB = np.asarray(RGB, dtype=np.float64)
-    R, G, B = RGB[..., 0], RGB[..., 1], RGB[..., 2]
+    # 1. Base Mapping is Identity
+    mapped_src = source_lin
+    base_grid = grid_lin
 
-    if degree <= 1:
-        return np.stack([R, G, B], axis=-1)
+    # 2. Residuals (exact error for each patch)
+    residuals = target_lin - mapped_src
 
-    # Degree 2: add cross-channel root terms
-    # np.abs prevents NaN from negative values after log decoding edge cases
-    RG = np.sqrt(np.abs(R * G))
-    RB = np.sqrt(np.abs(R * B))
-    GB = np.sqrt(np.abs(G * B))
-    return np.stack([R, G, B, RG, RB, GB], axis=-1)
+    # 3. Inverse Distance Weighting Interpolation
+    # Compute squared Euclidean distance from every grid point to every mapped patch
+    # grid: (G, 3), mapped_src: (N, 3) -> diff: (G, N, 3)
+    diff = base_grid[:, np.newaxis, :] - mapped_src[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    dist_sq = np.maximum(dist_sq, 1e-8)  # prevent division by zero
+
+    # Calculate weights (1 / d^p)
+    weights = 1.0 / (dist_sq ** (p / 2.0))
+    weight_sum = np.sum(weights, axis=1, keepdims=True)
+    weights_norm = weights / weight_sum
+
+    # Interpolate residuals and apply to base grid
+    grid_residuals = weights_norm @ residuals
+    final_grid = base_grid + grid_residuals
+
+    return final_grid
 
 
 def _weight_gray_patches(source: np.ndarray, target: np.ndarray,
@@ -309,37 +443,166 @@ def _weight_gray_patches(source: np.ndarray, target: np.ndarray,
     return source, target
 
 
-def _compute_correction_matrix(source_lin: np.ndarray, target_lin: np.ndarray,
-                               degree: int = 2, gray_weight: int = 10) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Root-Polynomial Expansion  (Finlayson et al. 2015)
+# ---------------------------------------------------------------------------
+
+def _expand_root_polynomial(rgb: np.ndarray, degree: int = 2) -> np.ndarray:
     """
-    Compute the root-polynomial correction matrix.
-    Returns shape (terms+1, 3) matrix  (last row = offset).
+    Expand RGB to root-polynomial terms of the given degree.
+    degree 1: [R, G, B, 1]                        → 4 terms  (linear matrix)
+    degree 2: [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB), 1]  → 7 terms
+    All terms scale linearly with scene irradiance → exposure-invariant.
     """
-    src_w, tgt_w = _weight_gray_patches(source_lin, target_lin, gray_weight)
-    src_w = np.clip(src_w, 1e-6, None)
+    r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
+    terms = [r, g, b]
+    if degree >= 2:
+        terms.append(np.sqrt(np.maximum(r * g, 0.0)))
+        terms.append(np.sqrt(np.maximum(r * b, 0.0)))
+        terms.append(np.sqrt(np.maximum(g * b, 0.0)))
+    terms.append(np.ones_like(r))
+    return np.hstack(terms)
 
-    expanded = _root_polynomial_expand(src_w, degree=degree)
-    # Add offset column (constant 1.0)
-    expanded_pad = np.c_[expanded, np.ones(expanded.shape[0])]
 
-    matrix, _, _, _ = np.linalg.lstsq(expanded_pad, tgt_w, rcond=None)
-    return matrix
+# ---------------------------------------------------------------------------
+# Display transform helpers  (for reference-match mode)
+# ---------------------------------------------------------------------------
+
+def _apply_display_decode(values: np.ndarray, transform_name: str) -> np.ndarray:
+    """Decode display-referred values to scene-linear."""
+    x = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+    if transform_name in DISPLAY_TRANSFORMS:
+        return DISPLAY_TRANSFORMS[transform_name]['decode'](x)
+    return np.power(x, 2.4)
 
 
-def _apply_correction(rgb_linear: np.ndarray, matrix: np.ndarray,
-                      degree: int = 2) -> np.ndarray:
-    """Apply pre-computed root-polynomial correction matrix."""
-    rgb_clipped = np.clip(rgb_linear, 1e-6, None)
-    expanded = _root_polynomial_expand(rgb_clipped, degree=degree)
-    expanded_pad = np.c_[expanded, np.ones(expanded.shape[0])]
-    return expanded_pad @ matrix
+def _apply_display_encode(values: np.ndarray, transform_name: str) -> np.ndarray:
+    """Encode scene-linear values to display-referred."""
+    x = np.clip(np.asarray(values, dtype=np.float64), 1e-6, 100.0)
+    if transform_name in DISPLAY_TRANSFORMS:
+        return np.clip(DISPLAY_TRANSFORMS[transform_name]['encode'](x), 0.0, 1.0)
+    return np.clip(np.power(x, 1.0 / 2.4), 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
 # LUT generation
 # ---------------------------------------------------------------------------
 
-_POLY_DEGREE = 2   # configurable: 1 = old linear, 2 = root-polynomial (recommended)
+_POLY_DEGREE = 2   # 2 = root-polynomial (Finlayson 2015) — exposure-invariant, handles non-linearities
+
+
+def _reference_neutral_indices(patch_count: int) -> np.ndarray:
+    """Return the four large neutral patches from every 32-patch chart."""
+    return np.array(
+        [i for i in range(patch_count) if (i % 32) in {28, 29, 30, 31}],
+        dtype=np.int64,
+    )
+
+
+def _prepare_reference_tone_curve(
+    source_rgb: np.ndarray,
+    target_rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a monotonic code-value tone curve from the large neutral patches.
+
+    Reference screenshots already contain their final display rendering. Fitting
+    the measured code values directly preserves the complete source-to-look
+    relationship and prevents unconstrained polynomial fits from producing
+    reversed tones.
+    """
+    neutral_indices = _reference_neutral_indices(len(source_rgb))
+    if len(neutral_indices) < 4:
+        raise ValueError("Reference matching requires a complete 32-patch chart")
+
+    source_neutral = np.mean(source_rgb[neutral_indices], axis=1)
+    target_neutral = target_rgb[neutral_indices]
+    order = np.argsort(source_neutral)
+
+    source_knots = np.concatenate(([0.0], source_neutral[order], [1.0]))
+    target_knots = np.vstack((np.zeros(3), target_neutral[order], np.ones(3)))
+
+    # Merge nearly identical source values before interpolation.
+    unique_source = []
+    unique_target = []
+    for value, rgb in zip(source_knots, target_knots):
+        if unique_source and abs(value - unique_source[-1]) < 1e-6:
+            unique_target[-1] = (unique_target[-1] + rgb) * 0.5
+        else:
+            unique_source.append(float(value))
+            unique_target.append(np.asarray(rgb, dtype=np.float64))
+
+    source_knots = np.asarray(unique_source, dtype=np.float64)
+    target_knots = np.asarray(unique_target, dtype=np.float64)
+
+    # Sampling noise must not make a neutral ramp reverse direction.
+    target_knots = np.maximum.accumulate(target_knots, axis=0)
+    target_knots = np.clip(target_knots, 0.0, 1.0)
+    return source_knots, target_knots
+
+
+def _apply_reference_tone_curve(
+    values: np.ndarray,
+    source_knots: np.ndarray,
+    target_knots: np.ndarray,
+) -> np.ndarray:
+    values = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+    return np.column_stack([
+        np.interp(values, source_knots, target_knots[:, channel])
+        for channel in range(3)
+    ])
+
+
+def _fit_reference_code_value_transform(
+    source_rgb: np.ndarray,
+    target_rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fit a stable source-code to final-display transform.
+
+    Luminance is handled by the measured neutral tone curve. A regularized
+    matrix maps only chroma deviations, so it cannot bend or reverse the
+    neutral axis.
+    """
+    source_knots, target_knots = _prepare_reference_tone_curve(source_rgb, target_rgb)
+    source_luma = np.mean(source_rgb, axis=1)
+    base_target = _apply_reference_tone_curve(source_luma, source_knots, target_knots)
+    source_chroma = source_rgb - source_luma[:, np.newaxis]
+    target_residual = target_rgb - base_target
+
+    gram = source_chroma.T @ source_chroma
+    ridge = max(float(np.trace(gram)) / 300.0, 1e-8)
+    chroma_matrix = np.linalg.solve(
+        gram + ridge * np.eye(3),
+        source_chroma.T @ target_residual,
+    )
+    return source_knots, target_knots, chroma_matrix
+
+
+def _apply_reference_code_value_transform(
+    rgb: np.ndarray,
+    source_knots: np.ndarray,
+    target_knots: np.ndarray,
+    chroma_matrix: np.ndarray,
+) -> np.ndarray:
+    rgb = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)
+    luma = np.mean(rgb, axis=1)
+    base_target = _apply_reference_tone_curve(luma, source_knots, target_knots)
+    chroma = rgb - luma[:, np.newaxis]
+    return np.clip(base_target + chroma @ chroma_matrix, 0.0, 1.0)
+
+
+def _normalize_black_points(source_lin: np.ndarray, target_lin: np.ndarray):
+    """
+    Shift both source and target so their black points are at zero.
+    Uses the 5th percentile as a robust estimate of the black level.
+    This ensures the LUT's (0,0,0) entry maps to near-black output.
+    """
+    src_black = float(np.percentile(source_lin, 5))
+    tgt_black = float(np.percentile(target_lin, 5))
+    src_norm = source_lin - src_black
+    tgt_norm = target_lin - tgt_black
+    return np.maximum(src_norm, 0.0), np.maximum(tgt_norm, 0.0), src_black, tgt_black
 
 
 def build_lut(
@@ -351,32 +614,47 @@ def build_lut(
     output_path: str,
 ) -> dict:
     """
-    Compute root-polynomial color correction and bake into a 65³ 3D LUT.
-    Source and target are both in log space; output LUT maps source_log → target_log.
+    Single / Master LUT: source-log → target-log.
+    Pipeline: log → linear, black-point normalization, weighted root-polynomial
+    matrix (no offset), denormalize, linear → target-log.
     """
-    # 1. Log → Linear
-    source_lin = _safe_log_decode(all_source_colors, source_log_curve)
-    target_lin = _safe_log_decode(all_target_colors, target_log_curve)
+    source_rgb = np.clip(np.asarray(all_source_colors, dtype=np.float64), 0.0, 1.0)
+    target_rgb = np.clip(np.asarray(all_target_colors, dtype=np.float64), 0.0, 1.0)
 
-    # 2. Compute correction matrix (root-polynomial, exposure-invariant)
-    matrix = _compute_correction_matrix(source_lin, target_lin, degree=_POLY_DEGREE)
+    # 1. Decode log to scene-linear
+    source_lin = _safe_log_decode(source_rgb, source_log_curve)
+    target_lin = _safe_log_decode(target_rgb, target_log_curve)
 
-    # 3. Measure accuracy on training patches
-    corrected = _apply_correction(source_lin, matrix, degree=_POLY_DEGREE)
-    mse = float(np.mean((target_lin - corrected) ** 2))
+    # 2. Black-point normalization — ensures (0,0,0) → (0,0,0)
+    source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 4. Bake into 65³ LUT
+    # 3. Weight gray patches
+    source_w, target_w = _weight_gray_patches(source_n, target_n, weight=10)
+
+    # 4. Root-polynomial expansion WITHOUT offset term (all-ones removed)
+    expanded = _expand_root_polynomial(source_w, degree=_POLY_DEGREE)[:, :-1]
+    M, _, _, _ = np.linalg.lstsq(expanded.astype(np.float64), target_w.astype(np.float64), rcond=None)
+
+    # 5. Measure accuracy on original patches
+    expanded_src = _expand_root_polynomial(source_n, degree=_POLY_DEGREE)[:, :-1]
+    predicted = np.dot(expanded_src, M)
+    mse = float(np.mean((target_n - predicted) ** 2))
+
+    # 6. Build 65³ LUT grid
     lut = colour.LUT3D(size=65, name=lut_name)
-    grid_lin = _safe_log_decode(lut.table, source_log_curve)
-    flat_grid_lin = grid_lin.reshape(-1, 3)
+    grid_rgb = lut.table.reshape(-1, 3)
 
-    flat_transformed_lin = _apply_correction(flat_grid_lin, matrix, degree=_POLY_DEGREE)
-    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
+    grid_lin = _safe_log_decode(grid_rgb, source_log_curve)
+    grid_n = np.maximum(grid_lin - src_black, 0.0)
+    grid_expanded = _expand_root_polynomial(grid_n, degree=_POLY_DEGREE)[:, :-1]
+    grid_transformed = np.dot(grid_expanded, M)
+    grid_transformed = np.maximum(grid_transformed + tgt_black, 1e-6)
+    grid_transformed = np.clip(grid_transformed, 1e-6, 100.0)
 
-    flat_transformed_log = _safe_log_encode(flat_transformed_lin, target_log_curve)
-    flat_transformed_log = np.clip(flat_transformed_log, 0.0, 1.0)
+    grid_log = _safe_log_encode(grid_transformed, target_log_curve)
+    grid_log = np.clip(grid_log, 0.0, 1.0)
 
-    lut.table = flat_transformed_log.reshape((65, 65, 65, 3))
+    lut.table = grid_log.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
     return {"mse": mse, "output_file": output_path}
 
@@ -390,35 +668,44 @@ def build_display_lut(
     output_path: str,
 ) -> dict:
     """
-    Compute root-polynomial color correction for log→display matching
-    and bake into a 65³ 3D LUT whose output is display-referred.
+    Reference-Match LUT: source-log → display-referred.
+
+    Both screenshots are sampled in their stored code values because the target
+    image already contains the complete creative rendering. A measured monotonic
+    neutral-axis curve plus a regularized chroma matrix preserves that empirical
+    source-to-look relationship without allowing the fit to reverse tones.
     """
-    xform = DISPLAY_TRANSFORMS.get(display_transform)
-    if xform is None:
-        raise ValueError(f"Unknown display transform: {display_transform}")
+    source_rgb = np.clip(np.asarray(all_source_colors, dtype=np.float64), 0.0, 1.0)
+    ref_rgb = np.clip(np.asarray(all_target_colors, dtype=np.float64), 0.0, 1.0)
 
-    # 1. Decode source log → linear; decode target display → linear
-    source_lin = _safe_log_decode(all_source_colors, source_log_curve)
-    target_lin = xform['decode'](all_target_colors)
+    source_knots, target_knots, chroma_matrix = _fit_reference_code_value_transform(
+        source_rgb,
+        ref_rgb,
+    )
+    predicted = _apply_reference_code_value_transform(
+        source_rgb,
+        source_knots,
+        target_knots,
+        chroma_matrix,
+    )
+    mse = float(np.mean((ref_rgb - predicted) ** 2))
 
-    # 2. Compute correction matrix
-    matrix = _compute_correction_matrix(source_lin, target_lin, degree=_POLY_DEGREE)
-
-    # 3. Measure accuracy
-    corrected = _apply_correction(source_lin, matrix, degree=_POLY_DEGREE)
-    mse = float(np.mean((target_lin - corrected) ** 2))
-
-    # 4. Bake into 65³ LUT: source_log → display
+    # Build the complete source-code → final-display transform.
     lut = colour.LUT3D(size=65, name=lut_name)
-    grid_lin = _safe_log_decode(lut.table, source_log_curve)
-    flat_grid_lin = grid_lin.reshape(-1, 3)
+    grid_rgb = lut.table.reshape(-1, 3)
+    grid_display = _apply_reference_code_value_transform(
+        grid_rgb,
+        source_knots,
+        target_knots,
+        chroma_matrix,
+    )
 
-    flat_transformed_lin = _apply_correction(flat_grid_lin, matrix, degree=_POLY_DEGREE)
-    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
-
-    flat_transformed_display = xform['encode'](flat_transformed_lin)
-    flat_transformed_display = np.clip(flat_transformed_display, 0.0, 1.0)
-
-    lut.table = flat_transformed_display.reshape((65, 65, 65, 3))
+    lut.table = grid_display.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
-    return {"mse": mse, "output_file": output_path}
+    return {
+        "mse": mse,
+        "output_file": output_path,
+        "method": "code-value-tone-chroma",
+        "tone_source": source_knots.tolist(),
+        "tone_target": target_knots.tolist(),
+    }

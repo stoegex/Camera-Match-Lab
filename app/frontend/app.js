@@ -181,11 +181,24 @@ const App = (() => {
     });
   }
 
+  let _globalFileInput = null;
+  function getFileInput(onchangeHandler) {
+    if (!_globalFileInput) {
+      _globalFileInput = document.createElement('input');
+      _globalFileInput.type = 'file';
+      _globalFileInput.accept = '.tif,.tiff,.jpg,.jpeg,.png';
+      _globalFileInput.style.display = 'none';
+      document.body.appendChild(_globalFileInput);
+    }
+    _globalFileInput.value = ''; // clear previous selection
+    _globalFileInput.onchange = onchangeHandler;
+    return _globalFileInput;
+  }
+
   function _slotClick (pairIdx, role) {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.tif,.tiff,.jpg,.jpeg,.png';
-    input.onchange = () => { if (input.files[0]) uploadToSlot(pairIdx, role, input.files[0]); };
+    const input = getFileInput(() => {
+      if (input.files[0]) uploadToSlot(pairIdx, role, input.files[0]);
+    });
     input.click();
   }
 
@@ -263,9 +276,9 @@ const App = (() => {
         <img class="drop-slot-thumb" id="slot-thumb-ref-reference" src="${state.refImgId ? state.cornerState[state.refImgId]?.imgSrc || '' : ''}" style="${state.refImgId ? '' : 'display:none'}" alt="" draggable="false"/>
       </div>
       <div class="ref-gamma-box" id="refGammaBox">
-        <div class="log-label target-label"><span class="log-dot target"></span> Referenz Display</div>
+        <div class="log-label target-label"><span class="log-dot target"></span> Referenz Kennzeichnung</div>
         <select class="ref-select" id="refGammaSelect" onchange="App.selectDisplayGamma(this.value)">
-          <option value="">-- Display wählen --</option>
+          <option value="">-- Projektstandard wählen --</option>
           ${(state.allDisplayGammas.length ? state.allDisplayGammas : ['Rec709 (BT.709)','sRGB','Gamma 2.4','Gamma 2.2']).map(g => {
             return `<option value="${g}" ${state.displayGamma === g ? 'selected' : ''}>${g}</option>`;
           }).join('')}
@@ -345,15 +358,12 @@ const App = (() => {
   }
 
   function _refSlotClick (role, idx) {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.tif,.tiff,.jpg,.jpeg,.png';
-    input.onchange = () => {
+    const input = getFileInput(() => {
       if (input.files[0]) {
         if (role === 'reference') uploadRefImage('reference', input.files[0]);
         else uploadRefImage('source', input.files[0], idx);
       }
-    };
+    });
     input.click();
   }
 
@@ -556,14 +566,14 @@ const App = (() => {
     const title = $('step3Title');
     const sub = $('step3Sub');
     if (title) title.textContent = 'Referenz & Camera Profile';
-    if (sub) sub.textContent = 'Wähle Display-Gamma für die Referenz und das Log-Profil für jede Source-Kamera.';
+    if (sub) sub.textContent = 'Die Profile dokumentieren den Workflow. Das Reference-Matching arbeitet direkt mit den gespeicherten Bildwerten.';
 
-    // Reference display gamma
+    // Reference display metadata
     let html = `<div class="log-select-card">
       <div class="log-label target-label">
-        <span class="log-dot target"></span> REFERENZ Display Gamma
+        <span class="log-dot target"></span> REFERENZ Projektstandard
       </div>
-      <p class="log-hint">Farbraum des Referenzbilds (z.B. Rec709 = Gamma 2.4)</p>
+      <p class="log-hint">Kennzeichnung für den Export; es wird keine zusätzliche Gamma-Konvertierung angewendet.</p>
       <div class="log-list-wrap">`;
     state.allDisplayGammas.forEach(g => {
       const sel = state.displayGamma === g ? ' selected' : '';
@@ -934,6 +944,32 @@ const App = (() => {
     canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
   }
 
+  async function autoDetectCorners () {
+    const btn = $('btnAutoDetect');
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = '⏳ Suche…';
+
+    const cs = state.cornerState[state.currentCornerImg];
+    if (!cs) return;
+
+    try {
+      const res = await api('POST', '/api/detect-chart', { img_id: state.currentCornerImg });
+      if (res.corners && res.corners.length === 4) {
+        cs.corners = res.corners;
+        _syncCornerDots(4);
+        $('step4Next').disabled = false;
+        const canvas = $('cornerCanvas');
+        drawCorners(canvas, cs.corners);
+        btn.textContent = '✓ Gefunden';
+      }
+    } catch (err) {
+      btn.textContent = '🎯 Auto-Detect';
+      console.warn('Auto-detect failed:', err.message);
+    }
+    btn.disabled = false;
+  }
+
   function undoLastCorner () {
     const cs = state.cornerState[state.currentCornerImg];
     if (!cs || cs.corners.length === 0) return;
@@ -1163,7 +1199,7 @@ const App = (() => {
 
       $('resultMeta').innerHTML = `
         <b>Modus:</b> Reference Match LUT — ${res.results.length} Kamera(s)<br/>
-        <b>Referenz Gamma:</b> ${state.displayGamma}<br/><br/>
+        <b>Referenz Projektstandard:</b> ${state.displayGamma}<br/><br/>
         ${lines}
       `;
 

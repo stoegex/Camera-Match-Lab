@@ -200,6 +200,15 @@ a { color: inherit; text-decoration: none; }
 }
 .btn-ghost.small { padding: 6px 12px; font-size: 12px; }
 
+.btn-auto { 
+  padding: 6px 14px; font-size: 12px; font-weight: 600;
+  background: var(--gold-dim); color: var(--gold-light);
+  border: 1px solid var(--gold); border-radius: var(--radius-sm);
+  cursor: pointer; transition: var(--transition);
+}
+.btn-auto:hover { background: var(--gold); color: var(--bg); }
+.btn-auto:disabled { opacity: 0.4; cursor: default; }
+
 .btn-secondary {
   display: inline-flex;
   align-items: center;

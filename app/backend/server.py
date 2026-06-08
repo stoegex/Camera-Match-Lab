@@ -23,6 +23,12 @@ from .lut_engine import (
     get_display_gammas,
     build_lut,
     build_display_lut,
+    detect_colorchecker,
+    _safe_log_decode,
+    _apply_display_decode,
+    _normalize_black_points,
+    _expand_root_polynomial,
+    _weight_gray_patches,
 )
 import numpy as np
 
@@ -244,7 +250,7 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
             if src_warped_id not in SESSIONS or tgt_warped_id not in SESSIONS:
                 return jsonify({"error": "Unknown warped image ID"}), 404
-            
+
             SESSIONS[src_warped_id]["timestamp"] = time.time()
             SESSIONS[tgt_warped_id]["timestamp"] = time.time()
 
@@ -274,21 +280,17 @@ def create_app(frontend_dir: str | None = None) -> Flask:
                 )
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
-        else:
-            try:
-                result = build_lut(
-                    all_source_colors, all_target_colors,
-                    source_log, target_log,
-                    lut_name, out_path,
-                )
-            except Exception as e:
-                return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "mse": result["mse"],
-            "filename": out_filename,
-            "download_url": f"/api/download/{out_filename}",
-        })
+            return jsonify({
+                "mse": result["mse"],
+                "filename": out_filename,
+                "download_url": f"/api/download/{out_filename}",
+                "diagnostics": {
+                    "method": result["method"],
+                    "patch_rms": round(float(np.sqrt(result["mse"])), 6),
+                    "patch_count": len(all_source_colors),
+                }
+            })
 
     @app.post("/api/generate-reference-luts")
     def api_generate_reference_luts():
@@ -362,6 +364,31 @@ def create_app(frontend_dir: str | None = None) -> Flask:
             })
 
         return jsonify({"results": results})
+
+    # ------------------------------------------------------------------
+    # API: Auto-detect ColorChecker corners
+    # ------------------------------------------------------------------
+
+    @app.post("/api/detect-chart")
+    def api_detect_chart():
+        cleanup_old_sessions()
+        data = request.get_json(force=True)
+        img_id = data.get("img_id")
+
+        if img_id not in SESSIONS:
+            return jsonify({"error": "Unknown image ID"}), 404
+
+        save_path = SESSIONS[img_id]["path"]
+        try:
+            img_float, _ = load_image(save_path)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+        corners = detect_colorchecker(img_float)
+        if corners is None:
+            return jsonify({"error": "Chart could not be auto-detected"}), 422
+
+        return jsonify({"corners": corners})
 
     # ------------------------------------------------------------------
     # API: Download .cube file
