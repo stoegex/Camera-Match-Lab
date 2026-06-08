@@ -496,22 +496,52 @@ def warp_image(img_float: np.ndarray, corners: list) -> tuple:
     return warped_float, warped_display, default_patch_px
 
 
-def extract_patches(warped_float: np.ndarray, patch_centers_px: list, roi_size: int = 20) -> np.ndarray:
+def extract_patches(warped_float: np.ndarray, patch_centers_px: list,
+                    roi_size: int = 20, sampling: str = 'trimmed') -> np.ndarray:
     """
     Average colour inside each patch ROI.
-    Returns shape (N, 3) float32 array in RGB order (0-1).
+
+    sampling modes:
+      'mean'    – plain arithmetic mean (fast, but hotpixel-sensitive)
+      'trimmed' – 10 % trimmed mean (discards lowest/highest 10 % of pixels
+                  per channel; robust against hotpixels and edge CA)
+      'gaussian'– Gaussian-weighted mean (σ = roi/4, center-weighted;
+                  de-emphasizes patch-edge artefacts)
+
+    Returns shape (N, 3) float64 array in RGB order (0-1).
     """
     patch_colors = []
     h, w = warped_float.shape[:2]
+    half = roi_size // 2
+
     for cx, cy in patch_centers_px:
-        cy_min = max(0, cy - roi_size // 2)
-        cy_max = min(h, cy + roi_size // 2)
-        cx_min = max(0, cx - roi_size // 2)
-        cx_max = min(w, cx + roi_size // 2)
-        roi = warped_float[cy_min:cy_max, cx_min:cx_max]
-        avg_color = roi.mean(axis=(0, 1))  # BGR
+        cy_min = max(0, cy - half)
+        cy_max = min(h, cy + half)
+        cx_min = max(0, cx - half)
+        cx_max = min(w, cx + half)
+        roi = warped_float[cy_min:cy_max, cx_min:cx_max].astype(np.float64)
+
+        if sampling == 'trimmed':
+            flat = roi.reshape(-1, 3)
+            trim_n = max(1, int(flat.shape[0] * 0.10))
+            avg_color = np.mean(np.sort(flat, axis=0)[trim_n:-trim_n], axis=0)
+        elif sampling == 'gaussian':
+            rh, rw = roi.shape[:2]
+            yy, xx = np.meshgrid(
+                np.arange(rh, dtype=np.float64) - rh / 2.0,
+                np.arange(rw, dtype=np.float64) - rw / 2.0,
+                indexing='ij',
+            )
+            sigma = max(rh, rw) / 4.0
+            kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+            kernel /= kernel.sum()
+            avg_color = np.sum(roi * kernel[..., np.newaxis], axis=(0, 1))
+        else:  # 'mean' (fallback)
+            avg_color = roi.mean(axis=(0, 1))
+
         patch_colors.append(avg_color)
-    colors = np.array(patch_colors, dtype=np.float32)
+
+    colors = np.array(patch_colors, dtype=np.float64)
     return colors[:, ::-1]  # BGR → RGB
 
 
@@ -799,6 +829,49 @@ def _compute_wb_gains(source_rgb: np.ndarray, target_rgb: np.ndarray) -> np.ndar
     return np.clip(gain, 0.5, 2.0)
 
 
+# ---------------------------------------------------------------------------
+# Delta-E quality report  (CIEDE2000, relative to sRGB / Rec.709 primaries)
+# ---------------------------------------------------------------------------
+
+def _compute_delta_e_report(source_rgb: np.ndarray, target_rgb: np.ndarray) -> dict:
+    """
+    Compute CIEDE2000 between target and predicted (corrected) RGB values.
+
+    Uses sRGB primaries as a pragmatic proxy for camera gamut (documented as
+    relative ΔE, not absolute CIE ΔE).  Returns per-patch list + summary stats.
+    """
+    if len(source_rgb) < 1:
+        return {"per_patch": [], "mean": None, "p95": None, "max": None}
+
+    try:
+        # Both are already in linear space (target, predicted after correction)
+        src_lin = np.clip(np.asarray(source_rgb, dtype=np.float64), 0.0, 1.0)
+        tgt_lin = np.clip(np.asarray(target_rgb, dtype=np.float64), 0.0, 1.0)
+
+        # RGB → XYZ via sRGB primaries (D65)
+        src_xyz = colour.RGB_to_XYZ(src_lin, colourspace='sRGB')
+        tgt_xyz = colour.RGB_to_XYZ(tgt_lin, colourspace='sRGB')
+
+        # XYZ → Lab
+        src_lab = colour.XYZ_to_Lab(src_xyz)
+        tgt_lab = colour.XYZ_to_Lab(tgt_xyz)
+
+        # CIEDE2000 per patch
+        de = colour.delta_E_CIE2000(src_lab, tgt_lab)
+        de_list = [float(d) for d in de]
+
+        return {
+            "per_patch": de_list,
+            "mean": round(float(np.mean(de_list)), 3),
+            "p95": round(float(np.percentile(de_list, 95)), 3),
+            "max": round(float(np.max(de_list)), 3),
+            "unit": "CIEDE2000 (relative, sRGB primaries)",
+        }
+    except Exception:
+        return {"per_patch": [], "mean": None, "p95": None, "max": None,
+                "error": "Delta-E computation failed"}
+
+
 def _normalize_black_points(source_lin: np.ndarray, target_lin: np.ndarray):
     """
     Estimate black points using the darkest ColorChecker patch (#31) with
@@ -842,11 +915,11 @@ def build_lut(
     Pipeline:
         1. Log → Linear decode
         2. Black-point normalization (Patch #31 reflectance extrapolation)
-        3. White-balance pre-gain on ALL patches
-        4. Root-polynomial matrix (Finlayson 2015, exposure-invariant)
-        5. Denormalize black, encode to target log
-    Steps 3+4 mean the matrix only handles chroma deviations — WB is already
-    corrected, preventing the matrix from over-saturating.
+        3. Auto exposure-gain from mid-gray patch (#30)
+        4. White-balance pre-gain on all patches
+        5. Root-polynomial matrix (Finlayson 2015, exposure-invariant)
+        6. Denormalize black, encode to target log
+    The matrix only handles chroma deviations — WB and exposure are pre-corrected.
     """
     source_rgb = np.clip(np.asarray(all_source_colors, dtype=np.float64), 0.0, 1.0)
     target_rgb = np.clip(np.asarray(all_target_colors, dtype=np.float64), 0.0, 1.0)
@@ -858,29 +931,42 @@ def build_lut(
     # 2. Black-point normalization — patch #31 reflectance extrapolation
     source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 3. White-balance pre-gain — computed from neutral patches before matrix fitting
+    # 3. Auto exposure-gain from mid-gray patch (#30) — only for Log→Log mode
+    midgray_idx = [i for i in range(len(source_n)) if (i % 32) == 30]
+    exposure_gain = 1.0
+    if midgray_idx:
+        src_mg = float(np.mean(source_n[midgray_idx]))
+        tgt_mg = float(np.mean(target_n[midgray_idx]))
+        if src_mg > 1e-8:
+            exposure_gain = tgt_mg / src_mg
+            # Safety: don't apply gains larger than ±2 stops
+            exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
+    source_n = source_n * exposure_gain
+
+    # 4. White-balance pre-gain — computed from neutral patches
     wb_gains = _compute_wb_gains(source_n, target_n)
     source_wb = source_n * wb_gains[np.newaxis, :]
 
-    # 4. Weight gray patches for the least-squares fit
+    # 5. Weight gray patches for the least-squares fit
     source_w, target_w = _weight_gray_patches(source_wb, target_n, weight=10)
 
-    # 5. Root-polynomial expansion WITHOUT offset (all-ones removed)
+    # 6. Root-polynomial expansion WITHOUT offset (all-ones removed)
     expanded = _expand_root_polynomial(source_w, degree=_POLY_DEGREE)[:, :-1]
     M, _, _, _ = np.linalg.lstsq(expanded.astype(np.float64), target_w.astype(np.float64), rcond=None)
 
-    # 6. Measure accuracy on original (unweighted, WB-corrected) patches
+    # 7. Measure accuracy on original (unweighted, WB-corrected) patches
     expanded_src = _expand_root_polynomial(source_wb, degree=_POLY_DEGREE)[:, :-1]
     predicted = np.dot(expanded_src, M)
     mse = float(np.mean((target_n - predicted) ** 2))
 
-    # 7. Build 65³ LUT grid
+    # 8. Build 65³ LUT grid
     lut = colour.LUT3D(size=65, name=lut_name)
     grid_rgb = lut.table.reshape(-1, 3)
 
     grid_lin = _safe_log_decode(grid_rgb, source_log_curve)
     grid_n = np.maximum(grid_lin - src_black, 0.0)
-    grid_wb = grid_n * wb_gains[np.newaxis, :]
+    grid_exposed = grid_n * exposure_gain
+    grid_wb = grid_exposed * wb_gains[np.newaxis, :]
     grid_expanded = _expand_root_polynomial(grid_wb, degree=_POLY_DEGREE)[:, :-1]
     grid_transformed = np.dot(grid_expanded, M)
     grid_transformed = np.maximum(grid_transformed + tgt_black, 1e-6)
@@ -891,10 +977,19 @@ def build_lut(
 
     lut.table = grid_log.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
+
+    delta_e = _compute_delta_e_report(predicted, target_n)
+
     return {
         "mse": mse,
         "output_file": output_path,
         "wb_gains": wb_gains.tolist(),
+        "exposure_gain": round(exposure_gain, 4),
+        "exposure_stops": round(np.log2(exposure_gain), 2),
+        "delta_e_mean": delta_e["mean"],
+        "delta_e_p95": delta_e["p95"],
+        "delta_e_max": delta_e["max"],
+        "delta_e_per_patch": delta_e["per_patch"],
     }
 
 
@@ -941,10 +1036,20 @@ def build_display_lut(
 
     lut.table = grid_display.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
+
+    # Delta-E: decode display-referred back to linear for CIEDE2000
+    pred_lin = _apply_display_decode(predicted, display_transform)
+    ref_lin = _apply_display_decode(ref_rgb, display_transform)
+    delta_e = _compute_delta_e_report(pred_lin, ref_lin)
+
     return {
         "mse": mse,
         "output_file": output_path,
         "method": "code-value-tone-chroma",
         "tone_source": source_knots.tolist(),
         "tone_target": target_knots.tolist(),
+        "delta_e_mean": delta_e["mean"],
+        "delta_e_p95": delta_e["p95"],
+        "delta_e_max": delta_e["max"],
+        "delta_e_per_patch": delta_e["per_patch"],
     }

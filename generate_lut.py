@@ -146,6 +146,8 @@ def extract_patches(img_float, pts):
     cv2.destroyWindow(window_name)
 
     # Finally perform extraction based on user-adjusted centers
+    # Trimmed mean: discard lowest/highest 10 % of pixels per channel
+    # to eliminate hotpixels and chromatic aberration at patch edges.
     patch_colors = []
     for cx, cy in drag_state['centers']:
         # clamp coords just in case user dragged off screen
@@ -153,9 +155,11 @@ def extract_patches(img_float, pts):
         cy_max = min(height, cy + roi_size//2)
         cx_min = max(0, cx - roi_size//2)
         cx_max = min(width, cx + roi_size//2)
-        
-        roi = warped[cy_min:cy_max, cx_min:cx_max]
-        avg_color = roi.mean(axis=(0, 1)) # BGR format
+
+        roi = warped[cy_min:cy_max, cx_min:cx_max].astype(np.float64)
+        flat = roi.reshape(-1, 3)
+        trim_n = max(1, int(flat.shape[0] * 0.10))
+        avg_color = np.mean(np.sort(flat, axis=0)[trim_n:-trim_n], axis=0)  # BGR
         patch_colors.append(avg_color)
     
     patch_colors = np.array(patch_colors)
@@ -595,6 +599,18 @@ def main():
     target_norm = np.maximum(target_lin64 - tgt_black, 0.0)
     print(f"Black-Point: Source={src_black:.6f} Target={tgt_black:.6f}")
 
+    # 1c. AUTO EXPOSURE-GAIN from mid-gray patch (#30) — Log→Log mode only
+    midgray_idx = [i for i in range(len(source_norm)) if (i % 32) == 30]
+    exposure_gain = 1.0
+    if midgray_idx:
+        src_mg = float(np.mean(source_norm[midgray_idx]))
+        tgt_mg = float(np.mean(target_norm[midgray_idx]))
+        if src_mg > 1e-8:
+            exposure_gain = tgt_mg / src_mg
+            exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
+    source_norm = source_norm * exposure_gain
+    print(f"Exposure-Gain: {exposure_gain:.4f} ({np.log2(exposure_gain):+.2f} EV)")
+
     # 1c. WHITE-BALANCE PRE-GAIN (all 4 gray patches averaged)
     neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
     if neutral_idx:
@@ -647,9 +663,10 @@ def main():
     
     flat_grid_lin = grid_lin.reshape(-1, 3)
     
-    # Normalize grid with same black point, apply WB gain, expand, apply matrix, denormalize
+    # Normalize grid with same black point, apply exposure gain + WB gain
     flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-    flat_grid_wb = flat_grid_norm * wb_gains
+    flat_grid_exposed = flat_grid_norm * exposure_gain
+    flat_grid_wb = flat_grid_exposed * wb_gains
     gr, gg, gb = flat_grid_wb[:, 0:1], flat_grid_wb[:, 1:2], flat_grid_wb[:, 2:3]
     flat_grid_expanded = np.hstack([gr, gg, gb,
         np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
