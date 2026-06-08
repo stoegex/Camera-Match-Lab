@@ -262,13 +262,13 @@ const App = (() => {
     if (!container) return;
     container.innerHTML = '';
 
-    let html = '<div class="ref-section"><h3 class="ref-section-title">🔘 REFERENZ-Bild (fertiger Look / Display)</h3>';
+    let html = '<div class="ref-section"><h3 class="ref-section-title">🔘 REFERENZ-Bild (Display, fertiger Look)</h3>';
     html += `<div class="pair-slots-row">
       <div class="drop-slot ${state.refImgId ? 'loaded' : ''}" id="slot-ref-reference"
            data-role="ref-reference" style="flex:1"
            onclick="App._refSlotClick('reference')">
         <div class="drop-slot-inner">
-          <div class="drop-slot-role reference-label">REFERENZ (Final Look)</div>
+          <div class="drop-slot-role reference-label">REFERENZ (Display Look)</div>
           <svg class="drop-slot-icon" width="32" height="32" viewBox="0 0 32 32" fill="none">
             <path d="M16 4v16M8 12l8-8 8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
             <rect x="4" y="22" width="24" height="6" rx="2" stroke="currentColor" stroke-width="1.5" opacity="0.3"/>
@@ -616,7 +616,7 @@ const App = (() => {
     const title = $('step3Title');
     const sub = $('step3Sub');
     if (title) title.textContent = 'Referenz & Camera Profile';
-    if (sub) sub.textContent = 'Die Profile dokumentieren den Workflow. Das Reference-Matching arbeitet direkt mit den gespeicherten Bildwerten.';
+    if (sub) sub.textContent = 'Die Profile dokumentieren den Workflow. Das Display-Reference-Matching arbeitet direkt mit den gespeicherten Bildwerten.';
 
     // Reference display metadata
     let html = `<div class="log-select-card">
@@ -1248,7 +1248,7 @@ const App = (() => {
       ).join('<br/>');
 
       $('resultMeta').innerHTML = `
-        <b>Modus:</b> Reference Match LUT — ${res.results.length} Kamera(s)<br/>
+        <b>Modus:</b> Display-Reference Match — ${res.results.length} Kamera(s)<br/>
         <b>Referenz Projektstandard:</b> ${state.displayGamma}<br/><br/>
         ${lines}
       `;

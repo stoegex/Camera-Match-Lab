@@ -294,7 +294,7 @@ def select_source_log_profile():
 
 
 def run_reference_match_mode():
-    print("\n--- REFERENCE MATCH LUT MODUS ---")
+    print("\n--- DISPLAY-REFERENCE MATCH MODUS ---")
     print("Dieser Modus gleicht mehrere Log-Kameras auf EIN Referenzbild ab.")
     print("Die Referenz ist bereits im Display-Farbraum (fertiger Look mit LUT).")
     print("=" * 50)
@@ -502,7 +502,7 @@ def main():
     print("==================================================")
     print(" [1] SINGLE LUT (Ein Bildpaar abgleichen)")
     print(" [2] MASTER LUT (Mehrere Bildpaare / Lichtsituationen verschmelzen)")
-    print(" [3] REFERENCE MATCH LUT (Referenz=fertiger Look, Sources=Log)")
+    print(" [3] DISPLAY-REFERENCE MATCH (Quell-Log → Display-Referenzbild)")
     mode = input("Waehle den Modus (1, 2 oder 3): ")
 
     if mode.strip() == '3':

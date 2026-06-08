@@ -1002,7 +1002,7 @@ def build_display_lut(
     output_path: str,
 ) -> dict:
     """
-    Reference-Match LUT: source-log → display-referred.
+    Display-Reference Match LUT: source-log → display-referred.
 
     Both screenshots are sampled in their stored code values because the target
     image already contains the complete creative rendering. A measured monotonic
