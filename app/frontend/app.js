@@ -186,7 +186,7 @@ const App = (() => {
     if (!_globalFileInput) {
       _globalFileInput = document.createElement('input');
       _globalFileInput.type = 'file';
-      _globalFileInput.accept = '.tif,.tiff,.jpg,.jpeg,.png';
+      _globalFileInput.accept = '.tif,.tiff,.jpg,.jpeg,.png,.mp4,.mov';
       _globalFileInput.style.display = 'none';
       document.body.appendChild(_globalFileInput);
     }

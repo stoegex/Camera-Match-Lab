@@ -126,7 +126,7 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
         f = request.files["file"]
         ext = Path(f.filename).suffix.lower()
-        if ext not in {".tif", ".tiff", ".jpg", ".jpeg", ".png"}:
+        if ext not in {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".mp4", ".mov", ".mxf", ".mts", ".m2ts", ".avi"}:
             return jsonify({"error": f"Unsupported file type: {ext}"}), 400
 
         # Save to temp file

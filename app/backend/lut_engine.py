@@ -148,7 +148,11 @@ _register_display_transform('Gamma 2.2', _decode_gamma22, _encode_gamma22)
 # ---------------------------------------------------------------------------
 
 def load_image(path: str):
-    """Load TIFF/JPG/PNG and return (float32 0-1 image, display 8-bit image)."""
+    """Load an image or extract the first frame from a video, return (float32 0-1 BGR, uint8 BGR)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.mp4', '.mov', '.mxf', '.mts', '.m2ts', '.avi'):
+        return _extract_video_frame(path)
+
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Cannot read image: {path}")
@@ -164,6 +168,20 @@ def load_image(path: str):
 
     img_display = (np.clip(img_float, 0, 1) * 255).astype(np.uint8)
     return img_float, img_display
+
+
+def _extract_video_frame(path: str):
+    """Open a video file and return the first valid frame as (float32 BGR, uint8 BGR)."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {path}")
+    success, frame = cap.read()
+    cap.release()
+    if not success or frame is None:
+        raise ValueError(f"No readable frame in video: {path}")
+    frame_float = frame.astype(np.float32) / 255.0
+    frame_uint8 = frame  # already uint8 BGR from VideoCapture
+    return frame_float, frame_uint8
 
 
 def image_to_jpeg_bytes(img_uint8_bgr: np.ndarray, quality: int = 85) -> bytes:
