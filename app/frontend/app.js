@@ -236,6 +236,9 @@ const App = (() => {
       slotEl.classList.add('loaded');
       lblEl.textContent = file.name;
 
+      // Auto-detect camera model + suggest log profile
+      fetchMetadata(res.img_id);
+
     } catch (err) {
       lblEl.textContent = `Fehler: ${err.message}`;
     }
@@ -404,10 +407,28 @@ const App = (() => {
       if (slotEl) slotEl.classList.add('loaded');
       lblEl.textContent = file.name;
 
+      // Auto-detect camera model + suggest log profile
+      fetchMetadata(res.img_id);
+
     } catch (err) {
       lblEl.textContent = `Fehler: ${err.message}`;
     }
     checkStep2Next();
+  }
+
+  async function fetchMetadata (imgId) {
+    try {
+      const meta = await api('POST', '/api/metadata', { img_id: imgId });
+      if (meta.make || meta.model) {
+        if (!state.imgMeta) state.imgMeta = {};
+        state.imgMeta[imgId] = meta;
+        if (meta.suggested_log) {
+          console.log(`Camera detected: ${meta.make} ${meta.model} → ${meta.suggested_log}`);
+        }
+      }
+    } catch (e) {
+      // Metadata extraction is optional — silently fail
+    }
   }
 
   function addRefSource () {
@@ -465,6 +486,23 @@ const App = (() => {
   }
 
   function renderLogLists () {
+    // Auto-select log profiles based on metadata
+    if (state.imgMeta) {
+      state.pairs.forEach(pair => {
+        if (pair.sourceImgId && !state.sourceLog) {
+          const meta = state.imgMeta[pair.sourceImgId];
+          if (meta && meta.suggested_log) {
+            selectLog('source', meta.suggested_log);
+          }
+        }
+        if (pair.targetImgId && !state.targetLog) {
+          const meta = state.imgMeta[pair.targetImgId];
+          if (meta && meta.suggested_log) {
+            selectLog('target', meta.suggested_log);
+          }
+        }
+      });
+    }
     renderList('sourceList', state.allProfiles, 'source');
     renderList('targetList', state.allProfiles, 'target');
   }
@@ -561,6 +599,18 @@ const App = (() => {
     const grid = $('logSelectGrid');
     if (!grid) return;
     grid.innerHTML = '';
+
+    // Auto-select source camera log profiles from metadata
+    if (state.imgMeta) {
+      state.sourceCameras.forEach((cam, idx) => {
+        if (cam.imgId && !cam.log) {
+          const meta = state.imgMeta[cam.imgId];
+          if (meta && meta.suggested_log) {
+            cam.log = meta.suggested_log;
+          }
+        }
+      });
+    }
 
     // Update step header for reference mode
     const title = $('step3Title');

@@ -366,21 +366,40 @@ def run_reference_match_mode():
 
         ref_lin = _apply_display_decode_display_to_linear(ref_colors, display_transform)
 
-        # Black-point normalization
+        # Black-point normalization using patch #31 reflectance extrapolation
         source_lin64 = np.asarray(source_lin, dtype=np.float64)
         ref_lin64 = np.asarray(ref_lin, dtype=np.float64)
-        src_black = float(np.percentile(source_lin64, 5))
-        tgt_black = float(np.percentile(ref_lin64, 5))
+        dark_idx = [i for i in range(len(source_lin64)) if (i % 32) == 31]
+        _CC_REFL_P31 = 0.031
+        if dark_idx:
+            src_dark = float(np.mean(source_lin64[dark_idx]))
+            tgt_dark = float(np.mean(ref_lin64[dark_idx]))
+            src_black = src_dark * (0.005 / _CC_REFL_P31)
+            tgt_black = tgt_dark * (0.005 / _CC_REFL_P31)
+        else:
+            src_black = float(np.percentile(source_lin64, 1))
+            tgt_black = float(np.percentile(ref_lin64, 1))
         source_norm = np.maximum(source_lin64 - src_black, 0.0)
         ref_norm = np.maximum(ref_lin64 - tgt_black, 0.0)
 
+        # White-balance pre-gain from all 4 gray patches
+        neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
+        if neutral_idx:
+            src_gray = np.mean(source_norm[neutral_idx], axis=0)
+            tgt_gray = np.mean(ref_norm[neutral_idx], axis=0)
+            wb_gains = tgt_gray / np.maximum(src_gray, 1e-8)
+            wb_gains = np.clip(wb_gains, 0.5, 2.0)
+        else:
+            wb_gains = np.ones(3, dtype=np.float64)
+        source_wb = source_norm * wb_gains
+
         # Root-polynomial expansion without offset: [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)]
-        r, g, b = source_norm[:, 0:1], source_norm[:, 1:2], source_norm[:, 2:3]
+        r, g, b = source_wb[:, 0:1], source_wb[:, 1:2], source_wb[:, 2:3]
         source_expanded = np.hstack([r, g, b,
             np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
 
         # Weighted least squares: duplicate gray patches 10x
-        gray_indices = [28, 29, 30, 31]
+        gray_indices = {28, 29, 30, 31}
         extra_s, extra_t = [], []
         for i in range(len(source_expanded)):
             if (i % 32) in gray_indices:
@@ -393,7 +412,7 @@ def run_reference_match_mode():
 
         matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, ref_norm, rcond=None)
 
-        # Measure accuracy on original patches
+        # Measure accuracy on original (WB-corrected) patches
         orig_expanded = np.hstack([r, g, b,
             np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
         predicted = np.dot(orig_expanded, matrix)
@@ -411,7 +430,8 @@ def run_reference_match_mode():
 
         flat_grid_lin = grid_lin.reshape(-1, 3)
         flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-        gr, gg, gb = flat_grid_norm[:, 0:1], flat_grid_norm[:, 1:2], flat_grid_norm[:, 2:3]
+        flat_grid_wb = flat_grid_norm * wb_gains
+        gr, gg, gb = flat_grid_wb[:, 0:1], flat_grid_wb[:, 1:2], flat_grid_wb[:, 2:3]
         flat_grid_expanded = np.hstack([gr, gg, gb,
             np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
         flat_transformed_lin = np.dot(flat_grid_expanded, matrix)
@@ -558,23 +578,42 @@ def main():
         source_lin = np.power(np.clip(all_source_colors, 0, 1), 2.4)
         target_lin = np.power(np.clip(all_target_colors, 0, 1), 2.4)
     
-    # 1b. BLACK-POINT NORMALIZATION – ensures black maps to black
+    # 1b. BLACK-POINT: Patch #31 (darkest gray, ~3.1% reflectance) with extrapolation
     source_lin64 = np.asarray(source_lin, dtype=np.float64)
     target_lin64 = np.asarray(target_lin, dtype=np.float64)
-    src_black = float(np.percentile(source_lin64, 5))
-    tgt_black = float(np.percentile(target_lin64, 5))
+    dark_idx = [i for i in range(len(source_lin64)) if (i % 32) == 31]
+    _CC_REFL_P31 = 0.031
+    if dark_idx:
+        src_dark = float(np.mean(source_lin64[dark_idx]))
+        tgt_dark = float(np.mean(target_lin64[dark_idx]))
+        src_black = src_dark * (0.005 / _CC_REFL_P31)
+        tgt_black = tgt_dark * (0.005 / _CC_REFL_P31)
+    else:
+        src_black = float(np.percentile(source_lin64, 1))
+        tgt_black = float(np.percentile(target_lin64, 1))
     source_norm = np.maximum(source_lin64 - src_black, 0.0)
     target_norm = np.maximum(target_lin64 - tgt_black, 0.0)
     print(f"Black-Point: Source={src_black:.6f} Target={tgt_black:.6f}")
+
+    # 1c. WHITE-BALANCE PRE-GAIN (all 4 gray patches averaged)
+    neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
+    if neutral_idx:
+        src_gray = np.mean(source_norm[neutral_idx], axis=0)
+        tgt_gray = np.mean(target_norm[neutral_idx], axis=0)
+        wb_gains = tgt_gray / np.maximum(src_gray, 1e-8)
+        wb_gains = np.clip(wb_gains, 0.5, 2.0)
+    else:
+        wb_gains = np.ones(3, dtype=np.float64)
+    source_wb = source_norm * wb_gains
+    print(f"WB-Gains: {wb_gains[0]:.4f} {wb_gains[1]:.4f} {wb_gains[2]:.4f}")
     
     # 2. ROOT-POLYNOMIAL EXPANSION (Finlayson 2015) – without offset
-    # [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)] → 6 terms, no all-ones column
-    r, g, b = source_norm[:, 0:1], source_norm[:, 1:2], source_norm[:, 2:3]
+    r, g, b = source_wb[:, 0:1], source_wb[:, 1:2], source_wb[:, 2:3]
     source_expanded = np.hstack([r, g, b,
         np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
 
     # 3. GEWICHTUNG DER GRAUBLOECKE (duplicate gray patches 10x)
-    gray_indices = [28, 29, 30, 31]
+    gray_indices = {28, 29, 30, 31}
     extra_s, extra_t = [], []
     for i in range(len(source_expanded)):
         if (i % 32) in gray_indices:
@@ -588,7 +627,7 @@ def main():
     # 4. MATRIX KALKULATION (6x3 Root-Polynomial, no offset)
     matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, target_norm, rcond=None)
     
-    # Measure accuracy on original patches
+    # Measure accuracy on original (WB-corrected) patches
     orig_expanded = np.hstack([r, g, b,
         np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
     predicted = np.dot(orig_expanded, matrix)
@@ -608,9 +647,10 @@ def main():
     
     flat_grid_lin = grid_lin.reshape(-1, 3)
     
-    # Normalize grid with same black point, expand, apply matrix, denormalize
+    # Normalize grid with same black point, apply WB gain, expand, apply matrix, denormalize
     flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-    gr, gg, gb = flat_grid_norm[:, 0:1], flat_grid_norm[:, 1:2], flat_grid_norm[:, 2:3]
+    flat_grid_wb = flat_grid_norm * wb_gains
+    gr, gg, gb = flat_grid_wb[:, 0:1], flat_grid_wb[:, 1:2], flat_grid_wb[:, 2:3]
     flat_grid_expanded = np.hstack([gr, gg, gb,
         np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
     flat_transformed_lin = np.dot(flat_grid_expanded, matrix)

@@ -766,14 +766,63 @@ def _apply_reference_code_value_transform(
     return np.clip(base_target + chroma @ chroma_matrix, 0.0, 1.0)
 
 
+# ColorChecker Video: reflectance of the darkest gray patch (#31, index 31)
+# Measured ~3.1 % under D65 (X-Rite / BabelColor data).
+# The full 32-patch table is available for future per-patch weighting.
+_CC_REFLECTANCE_P31 = 0.031
+
+
+def _neutral_patch_indices(patch_count: int) -> np.ndarray:
+    """Return indices of the four large neutral patches (28-31) in every chart set."""
+    return np.array(
+        [i for i in range(patch_count) if (i % 32) in {28, 29, 30, 31}],
+        dtype=np.int64,
+    )
+
+
+def _compute_wb_gains(source_rgb: np.ndarray, target_rgb: np.ndarray) -> np.ndarray:
+    """
+    Compute per-channel white-balance gains from all neutral patches.
+
+    Uses all four gray patches (28-31) averaged for robustness against
+    clipping of the white patch and spectral imbalances.
+
+    Returns (R, G, B) gain vector; clipped to [0.5, 2.0] as sanity.
+    """
+    neutral_idx = _neutral_patch_indices(len(source_rgb))
+    if len(neutral_idx) < 4:
+        return np.ones(3, dtype=np.float64)
+
+    src_gray = np.mean(source_rgb[neutral_idx], axis=0)
+    tgt_gray = np.mean(target_rgb[neutral_idx], axis=0)
+    gain = tgt_gray / np.maximum(src_gray, 1e-8)
+    return np.clip(gain, 0.5, 2.0)
+
+
 def _normalize_black_points(source_lin: np.ndarray, target_lin: np.ndarray):
     """
-    Shift both source and target so their black points are at zero.
-    Uses the 5th percentile as a robust estimate of the black level.
-    This ensures the LUT's (0,0,0) entry maps to near-black output.
+    Estimate black points using the darkest ColorChecker patch (#31) with
+    reflectance-based extrapolation.
+
+    Patch #31 has ~3.1 % reflectance — it is NOT true black.  Using its
+    measured value directly as the null point would clip real shadow detail.
+
+    Instead we extrapolate the measured sensor response to 0 % reflectance
+    using the known reflectance ratio, then add a small noise-floor margin.
     """
-    src_black = float(np.percentile(source_lin, 5))
-    tgt_black = float(np.percentile(target_lin, 5))
+    dark_idx = [i for i in range(len(source_lin)) if (i % 32) == 31]
+    if len(dark_idx) < 1:
+        src_black = float(np.percentile(source_lin, 1))
+        tgt_black = float(np.percentile(target_lin, 1))
+    else:
+        src_dark_mean = float(np.mean(source_lin[dark_idx]))
+        tgt_dark_mean = float(np.mean(target_lin[dark_idx]))
+        # Extrapolate from measured patch #31 (3.1 % reflectance) → 0 % reflectance
+        # with a 0.5 % additional offset to avoid amplifying sensor noise floor.
+        noise_margin = 0.005
+        src_black = src_dark_mean * (noise_margin / _CC_REFLECTANCE_P31)
+        tgt_black = tgt_dark_mean * (noise_margin / _CC_REFLECTANCE_P31)
+
     src_norm = source_lin - src_black
     tgt_norm = target_lin - tgt_black
     return np.maximum(src_norm, 0.0), np.maximum(tgt_norm, 0.0), src_black, tgt_black
@@ -788,9 +837,16 @@ def build_lut(
     output_path: str,
 ) -> dict:
     """
-    Single / Master LUT: source-log → target-log.
-    Pipeline: log → linear, black-point normalization, weighted root-polynomial
-    matrix (no offset), denormalize, linear → target-log.
+    Log-to-Log LUT: source-log → target-log.
+
+    Pipeline:
+        1. Log → Linear decode
+        2. Black-point normalization (Patch #31 reflectance extrapolation)
+        3. White-balance pre-gain on ALL patches
+        4. Root-polynomial matrix (Finlayson 2015, exposure-invariant)
+        5. Denormalize black, encode to target log
+    Steps 3+4 mean the matrix only handles chroma deviations — WB is already
+    corrected, preventing the matrix from over-saturating.
     """
     source_rgb = np.clip(np.asarray(all_source_colors, dtype=np.float64), 0.0, 1.0)
     target_rgb = np.clip(np.asarray(all_target_colors, dtype=np.float64), 0.0, 1.0)
@@ -799,28 +855,33 @@ def build_lut(
     source_lin = _safe_log_decode(source_rgb, source_log_curve)
     target_lin = _safe_log_decode(target_rgb, target_log_curve)
 
-    # 2. Black-point normalization — ensures (0,0,0) → (0,0,0)
+    # 2. Black-point normalization — patch #31 reflectance extrapolation
     source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 3. Weight gray patches
-    source_w, target_w = _weight_gray_patches(source_n, target_n, weight=10)
+    # 3. White-balance pre-gain — computed from neutral patches before matrix fitting
+    wb_gains = _compute_wb_gains(source_n, target_n)
+    source_wb = source_n * wb_gains[np.newaxis, :]
 
-    # 4. Root-polynomial expansion WITHOUT offset term (all-ones removed)
+    # 4. Weight gray patches for the least-squares fit
+    source_w, target_w = _weight_gray_patches(source_wb, target_n, weight=10)
+
+    # 5. Root-polynomial expansion WITHOUT offset (all-ones removed)
     expanded = _expand_root_polynomial(source_w, degree=_POLY_DEGREE)[:, :-1]
     M, _, _, _ = np.linalg.lstsq(expanded.astype(np.float64), target_w.astype(np.float64), rcond=None)
 
-    # 5. Measure accuracy on original patches
-    expanded_src = _expand_root_polynomial(source_n, degree=_POLY_DEGREE)[:, :-1]
+    # 6. Measure accuracy on original (unweighted, WB-corrected) patches
+    expanded_src = _expand_root_polynomial(source_wb, degree=_POLY_DEGREE)[:, :-1]
     predicted = np.dot(expanded_src, M)
     mse = float(np.mean((target_n - predicted) ** 2))
 
-    # 6. Build 65³ LUT grid
+    # 7. Build 65³ LUT grid
     lut = colour.LUT3D(size=65, name=lut_name)
     grid_rgb = lut.table.reshape(-1, 3)
 
     grid_lin = _safe_log_decode(grid_rgb, source_log_curve)
     grid_n = np.maximum(grid_lin - src_black, 0.0)
-    grid_expanded = _expand_root_polynomial(grid_n, degree=_POLY_DEGREE)[:, :-1]
+    grid_wb = grid_n * wb_gains[np.newaxis, :]
+    grid_expanded = _expand_root_polynomial(grid_wb, degree=_POLY_DEGREE)[:, :-1]
     grid_transformed = np.dot(grid_expanded, M)
     grid_transformed = np.maximum(grid_transformed + tgt_black, 1e-6)
     grid_transformed = np.clip(grid_transformed, 1e-6, 100.0)
@@ -830,7 +891,11 @@ def build_lut(
 
     lut.table = grid_log.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
-    return {"mse": mse, "output_file": output_path}
+    return {
+        "mse": mse,
+        "output_file": output_path,
+        "wb_gains": wb_gains.tolist(),
+    }
 
 
 def build_display_lut(

@@ -30,6 +30,7 @@ from .lut_engine import (
     _expand_root_polynomial,
     _weight_gray_patches,
 )
+from .metadata import extract_metadata_from_bytes, suggest_log_for_camera
 import numpy as np
 
 
@@ -389,6 +390,44 @@ def create_app(frontend_dir: str | None = None) -> Flask:
             return jsonify({"error": "Chart could not be auto-detected"}), 422
 
         return jsonify({"corners": corners})
+
+    # ------------------------------------------------------------------
+    # API: Extract camera metadata + suggest log profile
+    # ------------------------------------------------------------------
+
+    @app.post("/api/metadata")
+    def api_extract_metadata():
+        cleanup_old_sessions()
+        img_id = request.form.get("img_id") or request.args.get("img_id")
+        if img_id and img_id in SESSIONS:
+            file_path = SESSIONS[img_id]["path"]
+            filename = os.path.basename(file_path)
+            try:
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        else:
+            # Upload via multipart
+            f = request.files.get("file")
+            if not f:
+                return jsonify({"error": "No file provided"}), 400
+            file_data = f.read()
+            filename = f.filename or ''
+
+        meta = extract_metadata_from_bytes(file_data, filename)
+        return jsonify(meta)
+
+    @app.get("/api/suggest-log")
+    def api_suggest_log():
+        make = request.args.get("make", "")
+        model = request.args.get("model", "")
+        curve = suggest_log_for_camera(make, model)
+        return jsonify({
+            "make": make,
+            "model": model,
+            "suggested_log": curve or "",
+        })
 
     # ------------------------------------------------------------------
     # API: Download .cube file
