@@ -239,15 +239,29 @@ const App = (() => {
       // Auto-detect camera model + suggest log profile
       fetchMetadata(res.img_id);
 
-      // Video frame selector
+      // Video frame picker
       if (/\.(mp4|mov|mxf|mts|m2ts|avi)$/i.test(file.name)) {
-        showVideoFrameSelector(pairIdx, role, res.img_id);
+        _addVideoBadge(`slot-${pairIdx}-${role}`, res.img_id, role, pairIdx);
+        openVideoPicker(res.img_id, role, pairIdx);
       }
 
     } catch (err) {
       lblEl.textContent = `Fehler: ${err.message}`;
     }
     checkStep2Next();
+  }
+
+  function _addVideoBadge (containerId, imgId, role, pairIdx, idx) {
+    const container = $(containerId);
+    if (!container) return;
+    let badge = container.querySelector('.video-badge');
+    if (!badge) {
+      badge = document.createElement('button');
+      badge.className = 'video-badge';
+      badge.textContent = '🎬 Frame wählen';
+      badge.onclick = (e) => { e.stopPropagation(); openVideoPicker(imgId, role, pairIdx, idx); };
+      container.appendChild(badge);
+    }
   }
 
   function checkStep2Next () {
@@ -415,9 +429,11 @@ const App = (() => {
       // Auto-detect camera model + suggest log profile
       fetchMetadata(res.img_id);
 
-      // Video frame selector
+      // Video frame picker
       if (/\.(mp4|mov|mxf|mts|m2ts|avi)$/i.test(file.name)) {
-        showRefVideoFrameSelector(role, idx, res.img_id);
+        const slotId = role === 'reference' ? 'slot-ref-reference' : `slot-ref-source-${idx}`;
+        _addVideoBadge(slotId, res.img_id, role, undefined, idx);
+        openVideoPicker(res.img_id, role, undefined, idx);
       }
 
     } catch (err) {
@@ -446,156 +462,109 @@ const App = (() => {
     return promise;
   }
 
-  // ── Video frame selector ────────────────────────────
-  function showVideoFrameSelector (pairIdx, role, imgId) {
-    if (!state.videoFrames) state.videoFrames = {};
-    const container = $(`slot-${pairIdx}-${role}`);
-    if (!container) return;
+  // ── Video frame picker modal ──────────────────────────
+  let _vpImgId = null;
+  let _vpRole = null;
+  let _vpIdx = null;
+  let _vpPairIdx = null;
+  let _vpTotal = 0;
+  let _vpCurrent = 0;
 
-    // Insert frame selector bar
-    const barId = `vid-bar-${pairIdx}-${role}`;
-    let bar = $(barId);
-    if (bar) bar.remove();
-    bar = document.createElement('div');
-    bar.id = barId;
-    bar.className = 'video-frame-bar';
-    bar.innerHTML = `
-      <button class="vid-nav" onclick="App._videoPrevFrame('${pairIdx}','${role}')" title="Vorheriges Frame">◀</button>
-      <input type="range" class="vid-slider" id="${barId}-slider" min="0" max="0" value="0" oninput="App._videoSeekFrame('${pairIdx}','${role}', parseInt(this.value))" />
-      <button class="vid-nav" onclick="App._videoNextFrame('${pairIdx}','${role}')" title="Nächstes Frame">▶</button>
-      <span class="vid-label" id="${barId}-label">Frame: 0 / ...</span>
-      <button class="btn-primary vid-confirm" onclick="App._videoConfirmFrame('${pairIdx}','${role}')">Frame übernehmen</button>
-    `;
-    container.appendChild(bar);
+  function openVideoPicker (imgId, role, pairIdx, idx) {
+    _vpImgId = imgId;
+    _vpRole = role;
+    _vpPairIdx = pairIdx !== undefined ? pairIdx : null;
+    _vpIdx = idx !== undefined ? idx : null;
 
-    state.videoFrames[imgId] = { total: 0, current: 0 };
+    const modal = $('videoPickerModal');
+    if (!modal) return;
+    modal.style.display = 'flex';
 
-    // Load video info
+    $('videoPickerLabel').textContent = 'Lade Video-Info…';
+    $('videoPickerPreview').src = '';
+    $('videoPickerConfirm').disabled = true;
+
     api('GET', `/api/video-info/${imgId}`).then(info => {
-      state.videoFrames[imgId].total = info.frame_count;
-      const slider = $(`${barId}-slider`);
-      if (slider) slider.max = info.frame_count - 1;
-      _updateVideoLabel(pairIdx, role, 0, info.frame_count);
-    }).catch(() => {});
+      _vpTotal = info.frame_count;
+      _vpCurrent = 0;
+      $('videoPickerSlider').max = _vpTotal - 1;
+      $('videoPickerSlider').value = 0;
+      $('videoPickerLabel').textContent = `Frame 1 / ${_vpTotal}`;
+      $('videoPickerConfirm').disabled = false;
+      _loadVpFrame(0);
+    }).catch(e => {
+      $('videoPickerLabel').textContent = 'Fehler beim Laden';
+      console.warn('Video info failed:', e);
+    });
   }
 
-  function _videoSeekFrame (pairIdx, role, frame) {
-    const pair = state.pairs[pairIdx];
-    const imgId = role === 'source' ? pair.sourceImgId : pair.targetImgId;
-    const barId = `vid-bar-${pairIdx}-${role}`;
-    _loadVideoPreview(imgId, frame, `slot-thumb-${pairIdx}-${role}`, barId);
+  function closeVideoPicker () {
+    $('videoPickerModal').style.display = 'none';
   }
 
-  function _videoPrevFrame (pairIdx, role) {
-    const slider = $(`vid-bar-${pairIdx}-${role}-slider`);
-    if (slider && slider.value > 0) { slider.value--; _videoSeekFrame(pairIdx, role, slider.value); }
+  function _vpScrub (frame) {
+    _vpCurrent = frame;
+    $('videoPickerLabel').textContent = `Frame ${frame + 1} / ${_vpTotal}`;
+    _loadVpFrame(frame);
   }
 
-  function _videoNextFrame (pairIdx, role) {
-    const slider = $(`vid-bar-${pairIdx}-${role}-slider`);
-    if (slider && slider.value < slider.max) { slider.value++; _videoSeekFrame(pairIdx, role, slider.value); }
+  function _vpSeek (delta) {
+    const newFrame = Math.max(0, Math.min(_vpTotal - 1, _vpCurrent + delta));
+    _vpCurrent = newFrame;
+    $('videoPickerSlider').value = newFrame;
+    $('videoPickerLabel').textContent = `Frame ${newFrame + 1} / ${_vpTotal}`;
+    _loadVpFrame(newFrame);
   }
 
-  async function _videoConfirmFrame (pairIdx, role) {
-    const pair = state.pairs[pairIdx];
-    const imgId = role === 'source' ? pair.sourceImgId : pair.targetImgId;
-    const frame = state.videoFrames[imgId]?.current || 0;
+  async function _loadVpFrame (frame) {
     try {
-      const res = await api('POST', '/api/select-video-frame', { img_id: imgId, frame });
-      // Replace session image
-      if (role === 'source') pair.sourceImgId = res.img_id;
-      else pair.targetImgId = res.img_id;
-      state.cornerState[res.img_id] = {
-        corners: [], imgSrc: res.preview,
-        displayW: res.width, displayH: res.height,
-      };
-      const thumbEl = $(`slot-thumb-${pairIdx}-${role}`);
-      if (thumbEl) thumbEl.src = res.preview;
-      // Remove frame bar
-      const bar = $(`vid-bar-${pairIdx}-${role}`);
-      if (bar) bar.remove();
-    } catch (err) {
-      console.warn('Frame selection failed:', err.message);
-    }
+      const res = await api('POST', '/api/video-frame', { img_id: _vpImgId, frame });
+      $('videoPickerPreview').src = res.preview;
+    } catch (e) { console.warn('Frame load failed:', e); }
   }
 
-  async function _loadVideoPreview (imgId, frame, thumbId, barId) {
+  async function _vpConfirm () {
+    $('videoPickerConfirm').disabled = true;
+    $('videoPickerConfirm').textContent = '⏳ Speichere…';
     try {
-      const res = await api('POST', '/api/video-frame', { img_id: imgId, frame });
-      const thumbEl = $(thumbId);
-      if (thumbEl) thumbEl.src = res.preview;
-      if (state.videoFrames[imgId]) {
-        state.videoFrames[imgId].current = frame;
-        _updateVideoLabelFromId(barId, frame, state.videoFrames[imgId].total);
+      const res = await api('POST', '/api/select-video-frame', { img_id: _vpImgId, frame: _vpCurrent });
+
+      // Update state based on mode
+      if (_vpPairIdx !== null) {
+        // Single/Master mode
+        const pair = state.pairs[_vpPairIdx];
+        if (_vpRole === 'source') pair.sourceImgId = res.img_id;
+        else pair.targetImgId = res.img_id;
+        state.cornerState[res.img_id] = {
+          corners: [], imgSrc: res.preview,
+          displayW: res.width, displayH: res.height,
+        };
+        const thumbEl = $(`slot-thumb-${_vpPairIdx}-${_vpRole}`);
+        if (thumbEl) thumbEl.src = res.preview;
+      } else if (_vpRole === 'reference') {
+        state.refImgId = res.img_id;
+        state.cornerState[res.img_id] = {
+          corners: [], imgSrc: res.preview,
+          displayW: res.width, displayH: res.height,
+        };
+        const thumbEl = $('slot-thumb-ref-reference');
+        if (thumbEl) thumbEl.src = res.preview;
+      } else {
+        // Reference mode - source camera
+        if (state.sourceCameras[_vpIdx]) state.sourceCameras[_vpIdx].imgId = res.img_id;
+        state.cornerState[res.img_id] = {
+          corners: [], imgSrc: res.preview,
+          displayW: res.width, displayH: res.height,
+        };
+        const thumbEl = $(`slot-thumb-ref-source-${_vpIdx}`);
+        if (thumbEl) thumbEl.src = res.preview;
       }
-    } catch (e) { console.warn('Video frame load failed:', e.message); }
-  }
 
-  function _updateVideoLabel (pairIdx, role, frame, total) {
-    const el = $(`vid-bar-${pairIdx}-${role}-label`);
-    if (el) el.textContent = `Frame: ${frame + 1} / ${total}`;
-  }
-
-  function _updateVideoLabelFromId (barId, frame, total) {
-    const el = $(barId + '-label');
-    if (el) el.textContent = `Frame: ${frame + 1} / ${total}`;
-  }
-
-  // Reference mode video frame selector (simplified)
-  function showRefVideoFrameSelector (role, idx, imgId) {
-    // For reference mode, show a simple frame selector
-    if (!state.videoFrames) state.videoFrames = {};
-    const slotId = role === 'reference' ? 'slot-ref-reference' : `slot-ref-source-${idx}`;
-    const container = $(slotId);
-    if (!container) return;
-
-    const barId = `vid-bar-ref-${role}-${idx || 0}`;
-    let bar = $(barId);
-    if (bar) bar.remove();
-    bar = document.createElement('div');
-    bar.id = barId;
-    bar.className = 'video-frame-bar';
-    bar.innerHTML = `
-      <input type="range" class="vid-slider" id="${barId}-slider" min="0" max="0" value="0" oninput="App._refSeekFrame('${role}',${idx},parseInt(this.value))" />
-      <span class="vid-label" id="${barId}-label">Frame: 0 / ...</span>
-      <button class="btn-primary vid-confirm" onclick="App._refConfirmFrame('${role}',${idx})">Frame übernehmen</button>
-    `;
-    container.appendChild(bar);
-
-    state.videoFrames[imgId] = { total: 0, current: 0 };
-    api('GET', `/api/video-info/${imgId}`).then(info => {
-      state.videoFrames[imgId].total = info.frame_count;
-      const slider = $(`${barId}-slider`);
-      if (slider) slider.max = info.frame_count - 1;
-      _updateVideoLabelFromId(barId, 0, info.frame_count);
-    }).catch(() => {});
-  }
-
-  function _refSeekFrame (role, idx, frame) {
-    const imgId = role === 'reference' ? state.refImgId : state.sourceCameras[idx]?.imgId;
-    const thumbId = role === 'reference' ? 'slot-thumb-ref-reference' : `slot-thumb-ref-source-${idx}`;
-    const barId = `vid-bar-ref-${role}-${idx !== undefined ? idx : 0}`;
-    _loadVideoPreview(imgId, frame, thumbId, barId);
-  }
-
-  async function _refConfirmFrame (role, idx) {
-    const imgId = role === 'reference' ? state.refImgId : state.sourceCameras[idx]?.imgId;
-    const frame = state.videoFrames[imgId]?.current || 0;
-    try {
-      const res = await api('POST', '/api/select-video-frame', { img_id: imgId, frame });
-      if (role === 'reference') state.refImgId = res.img_id;
-      else if (state.sourceCameras[idx]) state.sourceCameras[idx].imgId = res.img_id;
-      state.cornerState[res.img_id] = {
-        corners: [], imgSrc: res.preview,
-        displayW: res.width, displayH: res.height,
-      };
-      const thumbId = role === 'reference' ? 'slot-thumb-ref-reference' : `slot-thumb-ref-source-${idx}`;
-      const thumbEl = $(thumbId);
-      if (thumbEl) thumbEl.src = res.preview;
-      const bar = $(`vid-bar-ref-${role}-${idx !== undefined ? idx : 0}`);
-      if (bar) bar.remove();
+      closeVideoPicker();
     } catch (err) {
       console.warn('Frame selection failed:', err.message);
+      $('videoPickerConfirm').textContent = '✅ Diesen Frame verwenden';
+      $('videoPickerConfirm').disabled = false;
     }
   }
 
@@ -1651,8 +1620,7 @@ const App = (() => {
     _refSlotClick, addRefSource, removeRefSource,
     selectDisplayGamma, selectRefSourceLog, filterRefSourceLog,
     saveAllRefLuts,
-    // Video frame selector
-    _videoPrevFrame, _videoNextFrame, _videoSeekFrame, _videoConfirmFrame,
-    _refSeekFrame, _refConfirmFrame,
+    // Video frame picker
+    closeVideoPicker, openVideoPicker, _vpScrub, _vpSeek, _vpConfirm,
   };
 })();

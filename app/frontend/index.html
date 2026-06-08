@@ -273,8 +273,32 @@
       </div>
     </section>
 
-  </main>
+    <!-- ── VIDEO FRAME PICKER MODAL ── -->
+    <div class="modal-overlay" id="videoPickerModal" style="display:none">
+      <div class="modal-frame-picker">
+        <div class="modal-picker-header">
+          <h2>🎬 Frame auswählen</h2>
+          <button class="modal-close" onclick="App.closeVideoPicker()">✕</button>
+        </div>
+        <div class="modal-picker-preview">
+          <img id="videoPickerPreview" src="" alt="Video frame" />
+        </div>
+        <div class="modal-picker-controls">
+          <button class="vid-nav" onclick="App._vpSeek(-5)">⏪ -5</button>
+          <button class="vid-nav" onclick="App._vpSeek(-1)">◀</button>
+          <input type="range" class="vid-slider" id="videoPickerSlider" min="0" max="0" value="0" oninput="App._vpScrub(parseInt(this.value))" />
+          <button class="vid-nav" onclick="App._vpSeek(1)">▶</button>
+          <button class="vid-nav" onclick="App._vpSeek(5)">⏩ +5</button>
+          <span class="vid-label" id="videoPickerLabel">Frame 1 / 1</span>
+        </div>
+        <div class="modal-picker-actions">
+          <button class="btn-ghost" onclick="App.closeVideoPicker()">Abbrechen</button>
+          <button class="btn-primary" id="videoPickerConfirm" onclick="App._vpConfirm()">✅ Diesen Frame verwenden</button>
+        </div>
+      </div>
+    </div>
 
+  </main>
   <script src="app.js"></script>
 </body>
 </html>
