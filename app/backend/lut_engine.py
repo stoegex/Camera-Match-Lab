@@ -182,8 +182,10 @@ def detect_colorchecker(img_float_bgr: np.ndarray) -> list | None:
     """
     Auto-detect ColorChecker chart corners in the image.
 
-    Uses local color-variance scanning to find the chart region, then Hough
-    line detection to refine the grid boundaries.
+    Multi-strategy approach:
+    1. Contour-based quadrilateral detection (primary)
+    2. Color variance scanning + adaptive Hough lines (fallback)
+    3. Sub-pixel corner refinement
 
     Returns:
         list of [[x,y]*4] normalized corners (TL,TR,BR,BL) or None on failure.
@@ -192,46 +194,179 @@ def detect_colorchecker(img_float_bgr: np.ndarray) -> list | None:
     if h < 100 or w < 100:
         return None
 
-    # 1. Downsample for speed
-    target_w = 1200
-    scale = min(target_w / w, 1.0)
-    small = cv2.resize(img_float_bgr, (int(w * scale), int(h * scale)))
-    sh, sw = small.shape[:2]
-    rgb_small = small[:, :, ::-1]  # BGR → RGB    (already float 0-1)
+    # Convert to uint8 for OpenCV operations
+    img_uint8 = (np.clip(img_float_bgr, 0.0, 1.0) * 255).astype(np.uint8)
+    gray = cv2.cvtColor(img_uint8, cv2.COLOR_BGR2GRAY)
 
-    # 2. Local colour variance – the chart grid has high variance
-    ksize = 15
+    # CLAHE preprocessing – critical for low-contrast / unevenly lit charts
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray)
+
+    # Try strategies at multiple scales (large → small chart in frame)
+    for down in [1.0, 0.6, 0.4]:
+        scale = min(down, 800.0 / max(w, h))
+        if scale >= 1.0 and down < 1.0:
+            continue
+        corners = _try_detect_at_scale(img_float_bgr, gray_eq, w, h, scale)
+        if corners is not None:
+            return corners
+
+    return None
+
+
+def _try_detect_at_scale(img_float_bgr, gray_eq, orig_w, orig_h, scale):
+    """Run contour and variance detection at a given downscale factor."""
+    if scale < 0.99:
+        nw, nh = int(orig_w * scale), int(orig_h * scale)
+        small = cv2.resize(img_float_bgr, (nw, nh))
+        gray_s = cv2.resize(gray_eq, (nw, nh))
+    else:
+        nw, nh = orig_w, orig_h
+        small = img_float_bgr
+        gray_s = gray_eq
+
+    # Strategy 1: contour-based quadrilateral
+    corners_px = _find_chart_quadrilateral(gray_s)
+    if corners_px is not None:
+        return [[x / nw, y / nh] for x, y in corners_px]
+
+    # Strategy 2: variance + adaptive Hough
+    corners_norm = _find_chart_variance_hough(small, nw, nh)
+    if corners_norm is not None:
+        return corners_norm
+
+    return None
+
+
+def _find_chart_quadrilateral(gray_eq):
+    """
+    Find the largest quadrilateral in the edge map of a CLAHE-equalized image.
+    Uses adaptive threshold + morphological cleanup to isolate the chart border.
+    """
+    h, w = gray_eq.shape[:2]
+    min_area = (w * h) * 0.04
+    max_area = (w * h) * 0.90
+
+    best_quad = None
+    best_score = 0.0
+
+    for block_size in (21, 31, 51):
+        for c_val in (5, 11, 17):
+            binary = cv2.adaptiveThreshold(
+                gray_eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, block_size, c_val,
+            )
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area < min_area or area > max_area:
+                    continue
+
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2)
+                    test_area = float(cv2.contourArea(pts))
+                    if test_area < min_area:
+                        continue
+
+                    # Verify convexity and reasonable aspect ratio
+                    pts_sorted = _order_corners(pts)
+                    tl, tr, br, bl = pts_sorted
+                    quad_w = float(np.linalg.norm(np.array(tr) - np.array(tl)))
+                    quad_h = float(np.linalg.norm(np.array(bl) - np.array(tl)))
+                    if quad_w < 5 or quad_h < 5:
+                        continue
+
+                    aspect = quad_w / quad_h
+                    if aspect < 0.35 or aspect > 1.8:
+                        continue
+
+                    # Score: prefer larger quads with aspect ratios close to CC Video (~0.57)
+                    size_score = test_area / (w * h)
+                    aspect_score = 1.0 - min(abs(aspect - 0.57) / 0.57, 1.0)
+                    score = size_score * 0.6 + aspect_score * 0.4
+
+                    if score > best_score:
+                        best_score = score
+                        best_quad = pts_sorted
+
+    if best_quad is not None:
+        tl, tr, br, bl = best_quad
+        return [(float(tl[0]), float(tl[1])),
+                (float(tr[0]), float(tr[1])),
+                (float(br[0]), float(br[1])),
+                (float(bl[0]), float(bl[1]))]
+    return None
+
+
+def _find_chart_variance_hough(small_float_bgr, sw, sh):
+    """
+    Fallback detection using local color-variance scanning to locate the
+    high-texture chart region, then adaptive Hough line grid refinement.
+    """
+    rgb_small = small_float_bgr[:, :, ::-1]  # BGR → RGB (float 0-1)
+
+    # Compute local color variance (larger kernel for robustness)
+    ksize = max(11, int(min(sw, sh) * 0.025))
+    ksize += 1 if ksize % 2 == 0 else 0  # ensure odd
+
     sq_sum = cv2.blur(rgb_small ** 2, (ksize, ksize), borderType=cv2.BORDER_REPLICATE)
     mean_sum = cv2.blur(rgb_small, (ksize, ksize), borderType=cv2.BORDER_REPLICATE)
     local_var = (sq_sum[:, :, 0] - mean_sum[:, :, 0] ** 2 +
                  sq_sum[:, :, 1] - mean_sum[:, :, 1] ** 2 +
                  sq_sum[:, :, 2] - mean_sum[:, :, 2] ** 2) / 3.0
 
-    # 3. Scan for window with maximum total variance
-    win_w = int(sw * 0.45)
-    win_h = int(sh * 0.60)
-    step = int(min(win_w, win_h) * 0.12)
-    best, best_y, best_x = 0.0, 0, 0
-    for y in range(0, sh - win_h, step):
-        for x in range(0, sw - win_w, step):
-            score = float(local_var[y:y + win_h, x:x + win_w].sum())
-            if score > best:
-                best, best_y, best_x = score, y, x
+    # Sliding window: try multiple aspect ratios matching CC variants
+    aspect_pairs = [(0.50, 0.65), (0.40, 0.55), (0.55, 0.70)]
 
-    # 4. Try Hough line refinement within the best window
-    margin = int(max(win_w, win_h) * 0.25)
+    best, best_y, best_x, best_ww, best_wh = 0.0, 0, 0, 0, 0
+    for wa, ha in aspect_pairs:
+        win_w = int(sw * wa)
+        win_h = int(sh * ha)
+        step = max(int(min(win_w, win_h) * 0.10), 4)
+        for y in range(0, sh - win_h, step):
+            for x in range(0, sw - win_w, step):
+                score = float(local_var[y:y + win_h, x:x + win_w].sum())
+                # Normalize by window area so different sizes are comparable
+                score_norm = score / (win_w * win_h)
+                if score_norm > best:
+                    best = score_norm
+                    best_y, best_x = y, x
+                    best_ww, best_wh = win_w, win_h
+
+    if best <= 0:
+        return None
+
+    # Expand slightly around the best window for edge detection
+    margin = int(max(best_ww, best_wh) * 0.20)
     ry1 = max(0, best_y - margin)
-    ry2 = min(sh, best_y + win_h + margin)
+    ry2 = min(sh, best_y + best_wh + margin)
     rx1 = max(0, best_x - margin)
-    rx2 = min(sw, best_x + win_w + margin)
+    rx2 = min(sw, best_x + best_ww + margin)
 
-    gray_region = (rgb_small[ry1:ry2, rx1:rx2, :].mean(axis=2) * 255).astype(np.uint8)
-    corners_norm = None
+    # Extract region for edge processing (with CLAHE)
+    region_float = small_float_bgr[ry1:ry2, rx1:rx2, :]
+    region_uint8 = (np.clip(region_float, 0.0, 1.0) * 255).astype(np.uint8)
+    region_gray = cv2.cvtColor(region_uint8, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    region_eq = clahe.apply(region_gray)
 
-    for low_t in (25, 45, 70):
-        edges = cv2.Canny(gray_region, low_t, low_t * 3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
-                                minLineLength=40, maxLineGap=30)
+    r_h, r_w = region_eq.shape[:2]
+    min_line_len = max(r_w, r_h) // 10
+    max_gap = max(r_w, r_h) // 20
+    hough_thresh = max(30, min(r_w, r_h) // 8)
+
+    for low_t in (15, 30, 50, 75):
+        edges = cv2.Canny(region_eq, low_t, low_t * 3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=hough_thresh,
+                                minLineLength=min_line_len, maxLineGap=max_gap)
         if lines is None:
             continue
 
@@ -239,44 +374,83 @@ def detect_colorchecker(img_float_bgr: np.ndarray) -> list | None:
         for line in lines:
             x1_l, y1_l, x2_l, y2_l = line[0]
             dx, dy = abs(x2_l - x1_l), abs(y2_l - y1_l)
-            if dx + dy < 15:
+            if dx + dy < max(8, min_line_len // 2):
                 continue
-            if dx > dy * 3.0:
+            if dx > dy * 2.5:
                 h_vals.extend([y1_l, y2_l])
-            elif dy > dx * 3.0:
+            elif dy > dx * 2.5:
                 v_vals.extend([x1_l, x2_l])
 
         if len(h_vals) < 6 or len(v_vals) < 3:
             continue
 
+        # Use median instead of percentile for outlier resistance
         hv, vv = np.array(h_vals), np.array(v_vals)
-        top_l = ry1 + float(np.percentile(hv, 3))
-        bot_l = ry1 + float(np.percentile(hv, 97))
-        left_l = rx1 + float(np.percentile(vv, 3))
-        right_l = rx1 + float(np.percentile(vv, 97))
+        h_med = float(np.median(hv))
+        v_med = float(np.median(vv))
+        h_mad = float(np.median(np.abs(hv - h_med))) * 1.4826
 
-        aspect = (right_l - left_l) / max(bot_l - top_l, 1)
-        if 0.25 < aspect < 1.6 and (right_l - left_l) > sw * 0.08:
-            corners_norm = [
+        # Filter outliers: keep lines within 2 sigma of median
+        h_in = hv[np.abs(hv - h_med) < max(h_mad * 2.0, 10)]
+        v_in = vv[np.abs(vv - v_med) < max(v_mad * 2.0, 10)]
+
+        if len(h_in) < 4 or len(v_in) < 3:
+            continue
+
+        top_l = ry1 + float(np.percentile(h_in, 2))
+        bot_l = ry1 + float(np.percentile(h_in, 98))
+        left_l = rx1 + float(np.percentile(v_in, 2))
+        right_l = rx1 + float(np.percentile(v_in, 98))
+
+        cw, ch = right_l - left_l, bot_l - top_l
+        if cw < sw * 0.06 or ch < sh * 0.06:
+            continue
+
+        aspect = cw / max(ch, 1)
+        if 0.30 < aspect < 1.6:
+            return [
                 [left_l / sw, top_l / sh],
                 [right_l / sw, top_l / sh],
                 [right_l / sw, bot_l / sh],
                 [left_l / sw, bot_l / sh],
             ]
-            break
 
-    # 5. Fallback – use the variance window with a 5 % inset
-    if corners_norm is None:
-        inset = 0.05
-        left = (best_x + win_w * inset) / sw
-        right = (best_x + win_w * (1 - inset)) / sw
-        top = (best_y + win_h * inset) / sh
-        bottom = (best_y + win_h * (1 - inset)) / sh
-        corners_norm = [[left, top], [right, top], [right, bottom], [left, bottom]]
+    # Fallback – return the variance window directly (with 5 % inset)
+    inset = 0.05
+    left = (best_x + best_ww * inset) / sw
+    right = (best_x + best_ww * (1 - inset)) / sw
+    top = (best_y + best_wh * inset) / sh
+    bottom = (best_y + best_wh * (1 - inset)) / sh
+    return [[left, top], [right, top], [right, bottom], [left, bottom]]
 
-    # 6. Remap coordinates back to original image (the down-sampled coords are
-    #    already normalized to 0-1, so they work for the original image too)
-    return [[float(x), float(y)] for x, y in corners_norm]
+
+def _order_corners(pts):
+    """
+    Order 4 corner points as [TL, TR, BR, BL] based on their spatial arrangement.
+    """
+    pts = np.array(pts, dtype=np.float64).reshape(4, 2)
+    # Sort by sum of coordinates (closest to origin = TL)
+    s = pts.sum(axis=1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    # Remaining two: sort by difference (y - x) – smaller diff = TR
+    diff = np.diff(pts, axis=1).ravel()
+    tr_idx = np.argmin(diff)
+    bl_idx = np.argmax(diff)
+    tr = pts[tr_idx]
+    bl = pts[bl_idx]
+
+    # Ensure we got the right ones (TL and BR should be distinct from TR/BL)
+    remaining = [i for i in range(4) if i not in (np.argmin(s), np.argmax(s))]
+    if len(remaining) == 2:
+        tr_cand = pts[remaining[0]]
+        bl_cand = pts[remaining[1]]
+        if tr_cand[0] < bl_cand[0]:
+            tr, bl = tr_cand, bl_cand
+        else:
+            tr, bl = bl_cand, tr_cand
+
+    return tl, tr, br, bl
 
 # Default patch center positions (fractional, for a 600×400 warped rectangle)
 # ColorChecker Video layout: 4 columns × 7 rows outer + 4 large gray blocks
