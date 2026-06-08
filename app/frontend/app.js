@@ -446,20 +446,46 @@ const App = (() => {
     const promise = (async () => {
       try {
         const meta = await api('POST', '/api/metadata', { img_id: imgId });
-        if (meta.make || meta.model) {
-          if (!state.imgMeta) state.imgMeta = {};
-          state.imgMeta[imgId] = meta;
-          if (meta.suggested_log) {
-            console.log(`Camera detected: ${meta.make} ${meta.model} → ${meta.suggested_log}`);
+        if (!state.imgMeta) state.imgMeta = {};
+        state.imgMeta[imgId] = meta;
+
+        if (meta.suggested_log) {
+          console.log(`Camera detected: ${meta.make} ${meta.model} → ${meta.suggested_log}`);
+
+          // Auto-select the log profile immediately if possible
+          if (!state.allProfiles.length) {
+            try { state.allProfiles = await api('GET', '/api/log-profiles'); } catch (e) {}
+          }
+          if (state.allProfiles.includes(meta.suggested_log)) {
+            if (state.mode === 'reference') {
+              // Reference mode: auto-select source camera log
+              state.sourceCameras.forEach((cam, idx) => {
+                if (cam.imgId === imgId && !cam.log) {
+                  selectRefSourceLog(idx, meta.suggested_log);
+                  console.log(`  → Auto-selected ${meta.suggested_log} for source camera ${idx + 1}`);
+                }
+              });
+            } else {
+              // Single/Master mode: set source or target log
+              state.pairs.forEach((pair, i) => {
+                if (pair.sourceImgId === imgId && !state.sourceLog) {
+                  selectLog('source', meta.suggested_log);
+                  console.log(`  → Auto-selected source log: ${meta.suggested_log}`);
+                }
+                if (pair.targetImgId === imgId && !state.targetLog) {
+                  selectLog('target', meta.suggested_log);
+                  console.log(`  → Auto-selected target log: ${meta.suggested_log}`);
+                }
+              });
+            }
           }
         }
       } catch (e) {
-        // Metadata extraction is optional — silently fail
+        console.warn('Metadata extraction failed:', e.message);
       }
     })();
     if (!state._metaPending) state._metaPending = {};
     state._metaPending[imgId] = promise;
-    return promise;
   }
 
   // ── Video frame picker modal ──────────────────────────
