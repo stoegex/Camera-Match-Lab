@@ -389,6 +389,7 @@ def _find_chart_variance_hough(small_float_bgr, sw, sh):
         h_med = float(np.median(hv))
         v_med = float(np.median(vv))
         h_mad = float(np.median(np.abs(hv - h_med))) * 1.4826
+        v_mad = float(np.median(np.abs(vv - v_med))) * 1.4826
 
         # Filter outliers: keep lines within 2 sigma of median
         h_in = hv[np.abs(hv - h_med) < max(h_mad * 2.0, 10)]
@@ -427,28 +428,23 @@ def _find_chart_variance_hough(small_float_bgr, sw, sh):
 def _order_corners(pts):
     """
     Order 4 corner points as [TL, TR, BR, BL] based on their spatial arrangement.
+    TL = min(x+y), BR = max(x+y).  Remaining two sorted by x-coordinate for TR/BL.
     """
     pts = np.array(pts, dtype=np.float64).reshape(4, 2)
-    # Sort by sum of coordinates (closest to origin = TL)
     s = pts.sum(axis=1)
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    # Remaining two: sort by difference (y - x) – smaller diff = TR
-    diff = np.diff(pts, axis=1).ravel()
-    tr_idx = np.argmin(diff)
-    bl_idx = np.argmax(diff)
-    tr = pts[tr_idx]
-    bl = pts[bl_idx]
+    tl_idx = int(np.argmin(s))
+    br_idx = int(np.argmax(s))
+    tl = pts[tl_idx]
+    br = pts[br_idx]
 
-    # Ensure we got the right ones (TL and BR should be distinct from TR/BL)
-    remaining = [i for i in range(4) if i not in (np.argmin(s), np.argmax(s))]
-    if len(remaining) == 2:
-        tr_cand = pts[remaining[0]]
-        bl_cand = pts[remaining[1]]
-        if tr_cand[0] < bl_cand[0]:
-            tr, bl = tr_cand, bl_cand
-        else:
-            tr, bl = bl_cand, tr_cand
+    remaining_idx = [i for i in range(4) if i not in (tl_idx, br_idx)]
+    if len(remaining_idx) != 2:
+        return tl, pts[0], br, pts[1]  # fallback
+    r0, r1 = remaining_idx
+    if pts[r0, 0] < pts[r1, 0]:
+        tr, bl = pts[r0], pts[r1]
+    else:
+        tr, bl = pts[r1], pts[r0]
 
     return tl, tr, br, bl
 
@@ -857,7 +853,7 @@ def _compute_delta_e_report(source_rgb: np.ndarray, target_rgb: np.ndarray) -> d
         tgt_lab = colour.XYZ_to_Lab(tgt_xyz)
 
         # CIEDE2000 per patch
-        de = colour.delta_E_CIE2000(src_lab, tgt_lab)
+        de = colour.difference.delta_E_CIE2000(src_lab, tgt_lab)
         de_list = [float(d) for d in de]
 
         return {
@@ -931,21 +927,20 @@ def build_lut(
     # 2. Black-point normalization — patch #31 reflectance extrapolation
     source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 3. Auto exposure-gain from mid-gray patch (#30) — only for Log→Log mode
-    midgray_idx = [i for i in range(len(source_n)) if (i % 32) == 30]
+    # 3. White-balance pre-gain — computed from neutral patches (before exposure)
+    wb_gains = _compute_wb_gains(source_n, target_n)
+    source_wb = source_n * wb_gains[np.newaxis, :]
+
+    # 4. Auto exposure-gain from mid-gray patch (#30) — applied AFTER WB
+    midgray_idx = [i for i in range(len(source_wb)) if (i % 32) == 30]
     exposure_gain = 1.0
     if midgray_idx:
-        src_mg = float(np.mean(source_n[midgray_idx]))
+        src_mg = float(np.mean(source_wb[midgray_idx]))
         tgt_mg = float(np.mean(target_n[midgray_idx]))
         if src_mg > 1e-8:
             exposure_gain = tgt_mg / src_mg
-            # Safety: don't apply gains larger than ±2 stops
             exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
-    source_n = source_n * exposure_gain
-
-    # 4. White-balance pre-gain — computed from neutral patches
-    wb_gains = _compute_wb_gains(source_n, target_n)
-    source_wb = source_n * wb_gains[np.newaxis, :]
+    source_wb = source_wb * exposure_gain
 
     # 5. Weight gray patches for the least-squares fit
     source_w, target_w = _weight_gray_patches(source_wb, target_n, weight=10)
@@ -965,9 +960,9 @@ def build_lut(
 
     grid_lin = _safe_log_decode(grid_rgb, source_log_curve)
     grid_n = np.maximum(grid_lin - src_black, 0.0)
-    grid_exposed = grid_n * exposure_gain
-    grid_wb = grid_exposed * wb_gains[np.newaxis, :]
-    grid_expanded = _expand_root_polynomial(grid_wb, degree=_POLY_DEGREE)[:, :-1]
+    grid_wb = grid_n * wb_gains[np.newaxis, :]
+    grid_exposed = grid_wb * exposure_gain
+    grid_expanded = _expand_root_polynomial(grid_exposed, degree=_POLY_DEGREE)[:, :-1]
     grid_transformed = np.dot(grid_expanded, M)
     grid_transformed = np.maximum(grid_transformed + tgt_black, 1e-6)
     grid_transformed = np.clip(grid_transformed, 1e-6, 100.0)

@@ -1001,7 +1001,11 @@ const App = (() => {
     btn.textContent = '⏳ Suche…';
 
     const cs = state.cornerState[state.currentCornerImg];
-    if (!cs) return;
+    if (!cs) {
+      btn.disabled = false;
+      btn.textContent = '🎯 Auto-Detect';
+      return;
+    }
 
     try {
       const res = await api('POST', '/api/detect-chart', { img_id: state.currentCornerImg });

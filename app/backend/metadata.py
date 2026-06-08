@@ -34,7 +34,7 @@ _CAMERA_LOG_MAP = [
     # RED
     (r'RED',        r'(KOMODO|HELIUM|GEMINI|MONSTRO|DRAGON)',   'REDlogFilm'),
     # Nikon
-    (r'NIKON',      r'(Z\s|D\d+)',                                 'N-Log'),
+    (r'NIKON',      r'(Z\d)',                                       'N-Log'),
     # Leica
     (r'LEICA',      r'(SL|Q[23]|M1)',                              'L-Log'),
     # Fujifilm
@@ -133,8 +133,8 @@ def _try_exiftool(data: bytes, ext: str) -> dict | None:
     """Write data to a temp file and call exiftool. Returns dict or None."""
     try:
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
-            tf.write(data)
             tmp_path = tf.name
+            tf.write(data)
     except Exception:
         return None
 

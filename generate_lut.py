@@ -6,6 +6,7 @@ try:
     import numpy as np
     import colour
     import json
+    from app.backend.lut_engine import build_display_lut
 except ImportError:
     print("---------------------------------------------------------")
     print("Error: Required libraries not found.")
@@ -353,100 +354,24 @@ def run_reference_match_mode():
 
         src_colors = process_single_image(src_path, f"Source: {src_name}")
 
-        # Compute and save LUT
+        # Compute and save LUT using the web engine's code-value tone+chroma pipeline
         lut_name = f"{src_name}_to_{ref_name}_DisplayMatch"
         out_filename = get_unique_filename(lut_name)
 
-        print(f"\nBerechne Root-Polynomial Matrix + 65^3 LUT: {source_log} -> {display_transform} ...")
-
+        print(f"\nBerechne Display-Reference Match LUT: {source_log} -> {display_transform} ...")
         try:
-            if source_log == "GP-Log2":
-                source_lin = (np.power(600.0, np.clip(src_colors, 0.0, 1.0)) - 1.0) / 599.0
-            else:
-                source_lin = colour.models.log_decoding(src_colors, function=source_log)
+            result = build_display_lut(
+                src_colors, ref_colors,
+                source_log, display_transform,
+                lut_name, out_filename,
+            )
         except Exception as e:
-            print(f"Warnung: Log Decoding fehlgeschlagen ({e}). Nutze Gamma 2.4 Fallback.")
-            source_lin = np.power(np.clip(src_colors, 0, 1), 2.4)
+            print(f"Fehler: {e}")
+            continue
 
-        ref_lin = _apply_display_decode_display_to_linear(ref_colors, display_transform)
-
-        # Black-point normalization using patch #31 reflectance extrapolation
-        source_lin64 = np.asarray(source_lin, dtype=np.float64)
-        ref_lin64 = np.asarray(ref_lin, dtype=np.float64)
-        dark_idx = [i for i in range(len(source_lin64)) if (i % 32) == 31]
-        _CC_REFL_P31 = 0.031
-        if dark_idx:
-            src_dark = float(np.mean(source_lin64[dark_idx]))
-            tgt_dark = float(np.mean(ref_lin64[dark_idx]))
-            src_black = src_dark * (0.005 / _CC_REFL_P31)
-            tgt_black = tgt_dark * (0.005 / _CC_REFL_P31)
-        else:
-            src_black = float(np.percentile(source_lin64, 1))
-            tgt_black = float(np.percentile(ref_lin64, 1))
-        source_norm = np.maximum(source_lin64 - src_black, 0.0)
-        ref_norm = np.maximum(ref_lin64 - tgt_black, 0.0)
-
-        # White-balance pre-gain from all 4 gray patches
-        neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
-        if neutral_idx:
-            src_gray = np.mean(source_norm[neutral_idx], axis=0)
-            tgt_gray = np.mean(ref_norm[neutral_idx], axis=0)
-            wb_gains = tgt_gray / np.maximum(src_gray, 1e-8)
-            wb_gains = np.clip(wb_gains, 0.5, 2.0)
-        else:
-            wb_gains = np.ones(3, dtype=np.float64)
-        source_wb = source_norm * wb_gains
-
-        # Root-polynomial expansion without offset: [R, G, B, sqrt(RG), sqrt(RB), sqrt(GB)]
-        r, g, b = source_wb[:, 0:1], source_wb[:, 1:2], source_wb[:, 2:3]
-        source_expanded = np.hstack([r, g, b,
-            np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
-
-        # Weighted least squares: duplicate gray patches 10x
-        gray_indices = {28, 29, 30, 31}
-        extra_s, extra_t = [], []
-        for i in range(len(source_expanded)):
-            if (i % 32) in gray_indices:
-                for _ in range(9):
-                    extra_s.append(source_expanded[i])
-                    extra_t.append(ref_norm[i])
-        if extra_s:
-            source_expanded = np.vstack([source_expanded, np.array(extra_s)])
-            ref_norm = np.vstack([ref_norm, np.array(extra_t)])
-
-        matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, ref_norm, rcond=None)
-
-        # Measure accuracy on original (WB-corrected) patches
-        orig_expanded = np.hstack([r, g, b,
-            np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
-        predicted = np.dot(orig_expanded, matrix)
-        mse = np.mean((ref_norm[:len(predicted)] - predicted) ** 2)
-        print(f"Abweichung (MSE im Linear-Space): {mse:.6f}")
-
-        lut = colour.LUT3D(size=65, name=lut_name)
-        try:
-            if source_log == "GP-Log2":
-                grid_lin = (np.power(600.0, np.clip(lut.table, 0.0, 1.0)) - 1.0) / 599.0
-            else:
-                grid_lin = colour.models.log_decoding(lut.table, function=source_log)
-        except Exception:
-            grid_lin = np.power(np.clip(lut.table, 0, 1), 2.4)
-
-        flat_grid_lin = grid_lin.reshape(-1, 3)
-        flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-        flat_grid_wb = flat_grid_norm * wb_gains
-        gr, gg, gb = flat_grid_wb[:, 0:1], flat_grid_wb[:, 1:2], flat_grid_wb[:, 2:3]
-        flat_grid_expanded = np.hstack([gr, gg, gb,
-            np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
-        flat_transformed_lin = np.dot(flat_grid_expanded, matrix)
-        flat_transformed_lin = np.maximum(flat_transformed_lin + tgt_black, 1e-6)
-        flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
-
-        flat_transformed_display = _apply_display_encode_linear_to_display(flat_transformed_lin, display_transform)
-        flat_transformed_display = np.clip(flat_transformed_display, 0.0, 1.0)
-
-        lut.table = flat_transformed_display.reshape((65, 65, 65, 3))
-        colour.write_LUT(lut, out_filename)
+        print(f"Abweichung (MSE im Code-Value-Space): {result['mse']:.6f}")
+        if result.get('delta_e_mean') is not None:
+            print(f"Delta-E (CIEDE2000): mean={result['delta_e_mean']:.3f}  p95={result['delta_e_p95']:.3f}  max={result['delta_e_max']:.3f}")
 
         print(f"\nERFOLG! LUT gespeichert: {out_filename}")
         lut_count += 1
@@ -599,19 +524,7 @@ def main():
     target_norm = np.maximum(target_lin64 - tgt_black, 0.0)
     print(f"Black-Point: Source={src_black:.6f} Target={tgt_black:.6f}")
 
-    # 1c. AUTO EXPOSURE-GAIN from mid-gray patch (#30) — Log→Log mode only
-    midgray_idx = [i for i in range(len(source_norm)) if (i % 32) == 30]
-    exposure_gain = 1.0
-    if midgray_idx:
-        src_mg = float(np.mean(source_norm[midgray_idx]))
-        tgt_mg = float(np.mean(target_norm[midgray_idx]))
-        if src_mg > 1e-8:
-            exposure_gain = tgt_mg / src_mg
-            exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
-    source_norm = source_norm * exposure_gain
-    print(f"Exposure-Gain: {exposure_gain:.4f} ({np.log2(exposure_gain):+.2f} EV)")
-
-    # 1c. WHITE-BALANCE PRE-GAIN (all 4 gray patches averaged)
+    # 1c. WHITE-BALANCE PRE-GAIN (all 4 gray patches averaged, before exposure)
     neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
     if neutral_idx:
         src_gray = np.mean(source_norm[neutral_idx], axis=0)
@@ -622,6 +535,18 @@ def main():
         wb_gains = np.ones(3, dtype=np.float64)
     source_wb = source_norm * wb_gains
     print(f"WB-Gains: {wb_gains[0]:.4f} {wb_gains[1]:.4f} {wb_gains[2]:.4f}")
+
+    # 1d. AUTO EXPOSURE-GAIN from mid-gray patch (#30) — AFTER WB
+    midgray_idx = [i for i in range(len(source_wb)) if (i % 32) == 30]
+    exposure_gain = 1.0
+    if midgray_idx:
+        src_mg = float(np.mean(source_wb[midgray_idx]))
+        tgt_mg = float(np.mean(target_norm[midgray_idx]))
+        if src_mg > 1e-8:
+            exposure_gain = tgt_mg / src_mg
+            exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
+    source_wb = source_wb * exposure_gain
+    print(f"Exposure-Gain: {exposure_gain:.4f} ({np.log2(exposure_gain):+.2f} EV)")
     
     # 2. ROOT-POLYNOMIAL EXPANSION (Finlayson 2015) – without offset
     r, g, b = source_wb[:, 0:1], source_wb[:, 1:2], source_wb[:, 2:3]
@@ -663,11 +588,11 @@ def main():
     
     flat_grid_lin = grid_lin.reshape(-1, 3)
     
-    # Normalize grid with same black point, apply exposure gain + WB gain
+    # Normalize grid with same black point, apply WB gain then exposure gain
     flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-    flat_grid_exposed = flat_grid_norm * exposure_gain
-    flat_grid_wb = flat_grid_exposed * wb_gains
-    gr, gg, gb = flat_grid_wb[:, 0:1], flat_grid_wb[:, 1:2], flat_grid_wb[:, 2:3]
+    flat_grid_wb = flat_grid_norm * wb_gains
+    flat_grid_exposed = flat_grid_wb * exposure_gain
+    gr, gg, gb = flat_grid_exposed[:, 0:1], flat_grid_exposed[:, 1:2], flat_grid_exposed[:, 2:3]
     flat_grid_expanded = np.hstack([gr, gg, gb,
         np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
     flat_transformed_lin = np.dot(flat_grid_expanded, matrix)

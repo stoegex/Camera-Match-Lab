@@ -398,8 +398,11 @@ def create_app(frontend_dir: str | None = None) -> Flask:
     @app.post("/api/metadata")
     def api_extract_metadata():
         cleanup_old_sessions()
-        img_id = request.form.get("img_id") or request.args.get("img_id")
+        # Accept JSON body (frontend) or multipart form
+        json_data = request.get_json(silent=True) or {}
+        img_id = json_data.get("img_id") or request.form.get("img_id") or request.args.get("img_id")
         if img_id and img_id in SESSIONS:
+            SESSIONS[img_id]["timestamp"] = time.time()
             file_path = SESSIONS[img_id]["path"]
             filename = os.path.basename(file_path)
             try:
@@ -435,7 +438,10 @@ def create_app(frontend_dir: str | None = None) -> Flask:
 
     @app.get("/api/download/<filename>")
     def api_download(filename: str):
-        file_path = os.path.join(OUTPUT_DIR, filename)
+        file_path = os.path.abspath(os.path.join(OUTPUT_DIR, filename))
+        # Prevent path-traversal outside OUTPUT_DIR
+        if not file_path.startswith(os.path.abspath(OUTPUT_DIR) + os.sep):
+            return jsonify({"error": "File not found"}), 404
         if not os.path.isfile(file_path):
             return jsonify({"error": "File not found"}), 404
         return send_file(file_path, as_attachment=True, download_name=filename)
