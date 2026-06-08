@@ -427,18 +427,23 @@ const App = (() => {
   }
 
   async function fetchMetadata (imgId) {
-    try {
-      const meta = await api('POST', '/api/metadata', { img_id: imgId });
-      if (meta.make || meta.model) {
-        if (!state.imgMeta) state.imgMeta = {};
-        state.imgMeta[imgId] = meta;
-        if (meta.suggested_log) {
-          console.log(`Camera detected: ${meta.make} ${meta.model} → ${meta.suggested_log}`);
+    const promise = (async () => {
+      try {
+        const meta = await api('POST', '/api/metadata', { img_id: imgId });
+        if (meta.make || meta.model) {
+          if (!state.imgMeta) state.imgMeta = {};
+          state.imgMeta[imgId] = meta;
+          if (meta.suggested_log) {
+            console.log(`Camera detected: ${meta.make} ${meta.model} → ${meta.suggested_log}`);
+          }
         }
+      } catch (e) {
+        // Metadata extraction is optional — silently fail
       }
-    } catch (e) {
-      // Metadata extraction is optional — silently fail
-    }
+    })();
+    if (!state._metaPending) state._metaPending = {};
+    state._metaPending[imgId] = promise;
+    return promise;
   }
 
   // ── Video frame selector ────────────────────────────
@@ -638,29 +643,38 @@ const App = (() => {
     if (title) title.textContent = 'Kamera Log-Profile';
     if (sub) sub.textContent = 'Wähle das Log-Profil für Quelle und Ziel.';
 
-    if (state.allProfiles.length) { renderLogLists(); return; }
-    try {
-      const profiles = await api('GET', '/api/log-profiles');
-      state.allProfiles = profiles;
-      renderLogLists();
-    } catch (e) {
-      console.error('Could not load log profiles', e);
+    if (!state.allProfiles.length) {
+      try {
+        state.allProfiles = await api('GET', '/api/log-profiles');
+      } catch (e) { console.error('Could not load log profiles', e); }
     }
+
+    // Await any pending metadata fetches before auto-select
+    if (state._metaPending) {
+      const promises = [];
+      state.pairs.forEach(p => {
+        if (p.sourceImgId && state._metaPending[p.sourceImgId]) promises.push(state._metaPending[p.sourceImgId]);
+        if (p.targetImgId && state._metaPending[p.targetImgId]) promises.push(state._metaPending[p.targetImgId]);
+      });
+      if (promises.length) await Promise.all(promises);
+    }
+
+    renderLogLists();
   }
 
   function renderLogLists () {
-    // Auto-select log profiles based on metadata
+    // Auto-select log profiles based on already-loaded metadata
     if (state.imgMeta) {
       state.pairs.forEach(pair => {
         if (pair.sourceImgId && !state.sourceLog) {
           const meta = state.imgMeta[pair.sourceImgId];
-          if (meta && meta.suggested_log) {
+          if (meta && meta.suggested_log && state.allProfiles.includes(meta.suggested_log)) {
             selectLog('source', meta.suggested_log);
           }
         }
         if (pair.targetImgId && !state.targetLog) {
           const meta = state.imgMeta[pair.targetImgId];
-          if (meta && meta.suggested_log) {
+          if (meta && meta.suggested_log && state.allProfiles.includes(meta.suggested_log)) {
             selectLog('target', meta.suggested_log);
           }
         }
