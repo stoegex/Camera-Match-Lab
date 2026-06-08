@@ -4,3 +4,10 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 colour-science>=0.4.4
 pyinstaller>=6.0.0
+Pillow>=10.0.0
+
+# ── Systemabhängigkeit (kein pip) ──
+# exiftool  –  für Video-Metadaten-Extraktion (Make, Model, Log-Profil)
+#   macOS:   brew install exiftool
+#   Linux:   sudo apt install exiftool
+#   Windows: https://exiftool.org (exiftool.exe in PATH)

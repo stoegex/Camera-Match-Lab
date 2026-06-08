@@ -8,9 +8,18 @@ log encoding curves.
 
 import io
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+
+# Check once at import time whether exiftool is available
+_EXIFTOOL_AVAILABLE = shutil.which('exiftool') is not None
+if not _EXIFTOOL_AVAILABLE:
+    import sys
+    print("⚠  exiftool not found – video metadata extraction disabled", file=sys.stderr)
+    print("   Install via: brew install exiftool  (macOS)  /  apt install exiftool  (Linux)", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +212,9 @@ _EXIFTOOL_TAGS = [
 
 def _try_exiftool(data: bytes, ext: str) -> dict | None:
     """Write data to a temp file and call exiftool. Returns dict or None."""
+    if not _EXIFTOOL_AVAILABLE:
+        return None
+
     try:
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
             tmp_path = tf.name
