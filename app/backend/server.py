@@ -433,6 +433,115 @@ def create_app(frontend_dir: str | None = None) -> Flask:
         })
 
     # ------------------------------------------------------------------
+    # API: Video frame extraction
+    # ------------------------------------------------------------------
+
+    @app.get("/api/video-info/<img_id>")
+    def api_video_info(img_id: str):
+        if img_id not in SESSIONS:
+            return jsonify({"error": "Unknown image ID"}), 404
+        file_path = SESSIONS[img_id]["path"]
+        SESSIONS[img_id]["timestamp"] = time.time()
+
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Cannot open video"}), 400
+        frame_count = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(_cv2.CAP_PROP_FPS))
+        cap.release()
+        return jsonify({"frame_count": frame_count, "fps": round(fps, 2)})
+
+    @app.post("/api/video-frame")
+    def api_video_frame():
+        data = request.get_json(force=True)
+        img_id = data.get("img_id")
+        frame_number = data.get("frame", 0)
+
+        if img_id not in SESSIONS:
+            return jsonify({"error": "Unknown image ID"}), 404
+        file_path = SESSIONS[img_id]["path"]
+        SESSIONS[img_id]["timestamp"] = time.time()
+
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Cannot open video"}), 400
+        cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_number)
+        success, frame = cap.read()
+        cap.release()
+        if not success or frame is None:
+            return jsonify({"error": f"Cannot read frame {frame_number}"}), 400
+
+        # Return frame as JPEG preview
+        h, w = frame.shape[:2]
+        max_w = 1200
+        if w > max_w:
+            scale = max_w / w
+            frame = _cv2.resize(frame, (int(w * scale), int(h * scale)))
+        preview_bytes = image_to_jpeg_bytes(frame, quality=80)
+        preview_b64 = base64.b64encode(preview_bytes).decode()
+        return jsonify({
+            "preview": f"data:image/jpeg;base64,{preview_b64}",
+            "frame": frame_number,
+            "width": w,
+            "height": h,
+        })
+
+    @app.post("/api/select-video-frame")
+    def api_select_video_frame():
+        """Persist the selected video frame as a new working image in the session."""
+        cleanup_old_sessions()
+        data = request.get_json(force=True)
+        img_id = data.get("img_id")
+        frame_number = data.get("frame", 0)
+
+        if img_id not in SESSIONS:
+            return jsonify({"error": "Unknown image ID"}), 404
+        file_path = SESSIONS[img_id]["path"]
+        SESSIONS[img_id]["timestamp"] = time.time()
+
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Cannot open video"}), 400
+        cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_number)
+        success, frame = cap.read()
+        cap.release()
+        if not success or frame is None:
+            return jsonify({"error": f"Cannot read frame {frame_number}"}), 400
+
+        # Save the selected frame as a JPEG in the temp dir
+        img_id_new = str(uuid.uuid4())
+        new_path = os.path.join(INSTANCE_TEMP_DIR, f"clm_{img_id_new}.jpg")
+        _cv2.imwrite(new_path, frame)
+
+        SESSIONS[img_id_new] = {
+            "path": new_path,
+            "timestamp": time.time(),
+            "original_video": img_id,
+            "frame": frame_number,
+        }
+
+        # Build preview
+        h, w = frame.shape[:2]
+        max_w = 1200
+        preview = frame.copy()
+        if w > max_w:
+            scale = max_w / w
+            preview = _cv2.resize(preview, (int(w * scale), int(h * scale)))
+        preview_bytes = image_to_jpeg_bytes(preview, quality=85)
+        preview_b64 = base64.b64encode(preview_bytes).decode()
+
+        return jsonify({
+            "img_id": img_id_new,
+            "preview": f"data:image/jpeg;base64,{preview_b64}",
+            "width": w,
+            "height": h,
+            "filename": f"frame_{frame_number:04d}.jpg",
+        })
+
+    # ------------------------------------------------------------------
     # API: Download .cube file
     # ------------------------------------------------------------------
 
