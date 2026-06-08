@@ -831,10 +831,16 @@ def _compute_wb_gains(source_rgb: np.ndarray, target_rgb: np.ndarray) -> np.ndar
 
 def _compute_delta_e_report(source_rgb: np.ndarray, target_rgb: np.ndarray) -> dict:
     """
-    Compute CIEDE2000 between target and predicted (corrected) RGB values.
+    Compute CIEDE2000 between target and predicted (corrected) values.
 
-    Uses sRGB primaries as a pragmatic proxy for camera gamut (documented as
-    relative ΔE, not absolute CIE ΔE).  Returns per-patch list + summary stats.
+    IMPORTANT: Uses sRGB primaries as a proxy for camera gamut.  In Log→Log
+    mode the input values are camera-native linear — NOT sRGB-encoded — so
+    the resulting ΔE is a *relative* figure for internal comparison only.
+    For Display-Reference-Match mode the values are display-encoded, making
+    sRGB primaries a reasonable approximation.
+
+    Returns per-patch list + summary stats (mean, p95, max).  The 'note'
+    field explains the limitation.
     """
     if len(source_rgb) < 1:
         return {"per_patch": [], "mean": None, "p95": None, "max": None}
@@ -870,27 +876,44 @@ def _compute_delta_e_report(source_rgb: np.ndarray, target_rgb: np.ndarray) -> d
 
 def _normalize_black_points(source_lin: np.ndarray, target_lin: np.ndarray):
     """
-    Estimate black points using the darkest ColorChecker patch (#31) with
-    reflectance-based extrapolation.
+    Estimate black points using the two extreme gray patches of the
+    ColorChecker Video (#28 white ~90 % reflectance, #31 dark ~3.1 %).
 
-    Patch #31 has ~3.1 % reflectance — it is NOT true black.  Using its
-    measured value directly as the null point would clip real shadow detail.
+    Assumes a linear sensor response between these two points.  The slope
+    (gain) and intercept (black offset) are solved from:
 
-    Instead we extrapolate the measured sensor response to 0 % reflectance
-    using the known reflectance ratio, then add a small noise-floor margin.
+        white = black + gain × 0.899
+        dark  = black + gain × 0.031
+
+    Extrapolating to 0 % reflectance gives a physically plausible black
+    point instead of a magic-number scaling factor.
     """
-    dark_idx = [i for i in range(len(source_lin)) if (i % 32) == 31]
-    if len(dark_idx) < 1:
+    white_idx = [i for i in range(len(source_lin)) if (i % 32) == 28]
+    dark_idx  = [i for i in range(len(source_lin)) if (i % 32) == 31]
+
+    if len(white_idx) >= 1 and len(dark_idx) >= 1:
+        src_w = float(np.mean(source_lin[white_idx]))
+        src_d = float(np.mean(source_lin[dark_idx]))
+        tgt_w = float(np.mean(target_lin[white_idx]))
+        tgt_d = float(np.mean(target_lin[dark_idx]))
+
+        # Solve:  white = black + gain * R_white,  dark = black + gain * R_dark
+        # → gain = (white - dark) / (R_white - R_dark)
+        # → black = dark - gain * R_dark
+        denom = 0.899 - _CC_REFLECTANCE_P31  # ≈ 0.868
+        if denom > 0 and src_w > src_d + 1e-8 and tgt_w > tgt_d + 1e-8:
+            src_gain = (src_w - src_d) / denom
+            tgt_gain = (tgt_w - tgt_d) / denom
+            src_black = src_d - src_gain * _CC_REFLECTANCE_P31
+            tgt_black = tgt_d - tgt_gain * _CC_REFLECTANCE_P31
+            src_black = max(src_black, 0.0)
+            tgt_black = max(tgt_black, 0.0)
+        else:
+            src_black = float(np.percentile(source_lin, 1))
+            tgt_black = float(np.percentile(target_lin, 1))
+    else:
         src_black = float(np.percentile(source_lin, 1))
         tgt_black = float(np.percentile(target_lin, 1))
-    else:
-        src_dark_mean = float(np.mean(source_lin[dark_idx]))
-        tgt_dark_mean = float(np.mean(target_lin[dark_idx]))
-        # Extrapolate from measured patch #31 (3.1 % reflectance) → 0 % reflectance
-        # with a 0.5 % additional offset to avoid amplifying sensor noise floor.
-        noise_margin = 0.005
-        src_black = src_dark_mean * (noise_margin / _CC_REFLECTANCE_P31)
-        tgt_black = tgt_dark_mean * (noise_margin / _CC_REFLECTANCE_P31)
 
     src_norm = source_lin - src_black
     tgt_norm = target_lin - tgt_black
@@ -927,19 +950,23 @@ def build_lut(
     # 2. Black-point normalization — patch #31 reflectance extrapolation
     source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 3. White-balance pre-gain — computed from neutral patches (before exposure)
-    wb_gains = _compute_wb_gains(source_n, target_n)
-    source_wb = source_n * wb_gains[np.newaxis, :]
-
-    # 4. Auto exposure-gain from mid-gray patch (#30) — applied AFTER WB
-    midgray_idx = [i for i in range(len(source_wb)) if (i % 32) == 30]
+    # 3. Auto exposure-gain from mid-gray patch (#30) on perceptually weighted
+    #    luminance BEFORE WB — so WB differences don't leak into exposure.
+    midgray_idx = [i for i in range(len(source_n)) if (i % 32) == 30]
     exposure_gain = 1.0
     if midgray_idx:
-        src_mg = float(np.mean(source_wb[midgray_idx]))
-        tgt_mg = float(np.mean(target_n[midgray_idx]))
+        # Luma: BT.601 coefficients, effectively mono-chromatic → WB-independent
+        def _luma(rgb):
+            return 0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]
+        src_mg = float(np.mean(_luma(source_n[midgray_idx])))
+        tgt_mg = float(np.mean(_luma(target_n[midgray_idx])))
         if src_mg > 1e-8:
             exposure_gain = tgt_mg / src_mg
             exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
+
+    # 4. White-balance pre-gain — computed from neutral patches
+    wb_gains = _compute_wb_gains(source_n, target_n)
+    source_wb = source_n * wb_gains[np.newaxis, :]
     source_wb = source_wb * exposure_gain
 
     # 5. Weight gray patches for the least-squares fit

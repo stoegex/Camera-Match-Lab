@@ -6,14 +6,17 @@ try:
     import numpy as np
     import colour
     import json
-    from app.backend.lut_engine import build_display_lut
+    from app.backend.lut_engine import build_display_lut, build_lut
 except ImportError:
-    print("---------------------------------------------------------")
-    print("Error: Required libraries not found.")
-    print("Please install them by opening your terminal and typing:")
-    print("pip install opencv-python numpy colour-science")
-    print("---------------------------------------------------------")
-    sys.exit(1)
+    try:
+        from lut_engine import build_display_lut, build_lut
+    except ImportError:
+        print("---------------------------------------------------------")
+        print("Error: Required libraries not found.")
+        print("Please install them by opening your terminal and typing:")
+        print("pip install opencv-python numpy colour-science")
+        print("---------------------------------------------------------")
+        sys.exit(1)
 
 def select_points(image, window_name="Select 4 corners"):
     points = []
@@ -240,38 +243,6 @@ def select_display_transform():
     return display_options[idx]
 
 
-def _apply_display_decode_display_to_linear(ref_colors, transform_name):
-    """Decode display-referred values to linear using proper OETF inverse."""
-    import colour
-    x = np.clip(ref_colors, 0.0, 1.0)
-    if transform_name == 'Rec709 (BT.709)':
-        return colour.models.oetf_inverse_BT709(x)
-    elif transform_name == 'sRGB':
-        return colour.models.eotf_sRGB(x)
-    elif transform_name == 'Gamma 2.4':
-        return np.power(x, 2.4)
-    elif transform_name == 'Gamma 2.2':
-        return np.power(x, 2.2)
-    else:
-        return np.power(x, 2.4)
-
-
-def _apply_display_encode_linear_to_display(linear, transform_name):
-    """Encode linear values to display space using proper OETF."""
-    import colour
-    x = np.clip(linear, 1e-6, 100.0)
-    if transform_name == 'Rec709 (BT.709)':
-        return np.clip(colour.models.oetf_BT709(x), 0.0, 1.0)
-    elif transform_name == 'sRGB':
-        return np.clip(colour.models.eotf_inverse_sRGB(x), 0.0, 1.0)
-    elif transform_name == 'Gamma 2.4':
-        return np.clip(np.power(x, 1.0 / 2.4), 0.0, 1.0)
-    elif transform_name == 'Gamma 2.2':
-        return np.clip(np.power(x, 1.0 / 2.2), 0.0, 1.0)
-    else:
-        return np.clip(np.power(x, 1.0 / 2.4), 0.0, 1.0)
-
-
 def select_source_log_profile():
     import colour
     available_curves = sorted(list(colour.models.LOG_ENCODINGS.keys()))
@@ -489,134 +460,25 @@ def main():
         all_source_colors = s_colors
         all_target_colors = t_colors
         
-    print("\nBerechne Root-Polynomial Matrix + Offset Optimierung (Linear Space)...")
-    
-    # 1. LOG TO LINEAR CONVERSION
-    try:
-        if source_log_curve == "GP-Log2":
-            source_lin = (np.power(600.0, np.clip(all_source_colors, 0.0, 1.0)) - 1.0) / 599.0
-        else:
-            source_lin = colour.models.log_decoding(all_source_colors, function=source_log_curve)
-            
-        if target_log_curve == "GP-Log2":
-            target_lin = (np.power(600.0, np.clip(all_target_colors, 0.0, 1.0)) - 1.0) / 599.0
-        else:
-            target_lin = colour.models.log_decoding(all_target_colors, function=target_log_curve)
-    except Exception as e:
-        print(f"Warnung: Natives Log Decoding fehlgeschlagen ({e}). Nutze Gamma 2.4 Fallback.")
-        source_lin = np.power(np.clip(all_source_colors, 0, 1), 2.4)
-        target_lin = np.power(np.clip(all_target_colors, 0, 1), 2.4)
-    
-    # 1b. BLACK-POINT: Patch #31 (darkest gray, ~3.1% reflectance) with extrapolation
-    source_lin64 = np.asarray(source_lin, dtype=np.float64)
-    target_lin64 = np.asarray(target_lin, dtype=np.float64)
-    dark_idx = [i for i in range(len(source_lin64)) if (i % 32) == 31]
-    _CC_REFL_P31 = 0.031
-    if dark_idx:
-        src_dark = float(np.mean(source_lin64[dark_idx]))
-        tgt_dark = float(np.mean(target_lin64[dark_idx]))
-        src_black = src_dark * (0.005 / _CC_REFL_P31)
-        tgt_black = tgt_dark * (0.005 / _CC_REFL_P31)
-    else:
-        src_black = float(np.percentile(source_lin64, 1))
-        tgt_black = float(np.percentile(target_lin64, 1))
-    source_norm = np.maximum(source_lin64 - src_black, 0.0)
-    target_norm = np.maximum(target_lin64 - tgt_black, 0.0)
-    print(f"Black-Point: Source={src_black:.6f} Target={tgt_black:.6f}")
-
-    # 1c. WHITE-BALANCE PRE-GAIN (all 4 gray patches averaged, before exposure)
-    neutral_idx = [i for i in range(len(source_norm)) if (i % 32) in {28, 29, 30, 31}]
-    if neutral_idx:
-        src_gray = np.mean(source_norm[neutral_idx], axis=0)
-        tgt_gray = np.mean(target_norm[neutral_idx], axis=0)
-        wb_gains = tgt_gray / np.maximum(src_gray, 1e-8)
-        wb_gains = np.clip(wb_gains, 0.5, 2.0)
-    else:
-        wb_gains = np.ones(3, dtype=np.float64)
-    source_wb = source_norm * wb_gains
-    print(f"WB-Gains: {wb_gains[0]:.4f} {wb_gains[1]:.4f} {wb_gains[2]:.4f}")
-
-    # 1d. AUTO EXPOSURE-GAIN from mid-gray patch (#30) — AFTER WB
-    midgray_idx = [i for i in range(len(source_wb)) if (i % 32) == 30]
-    exposure_gain = 1.0
-    if midgray_idx:
-        src_mg = float(np.mean(source_wb[midgray_idx]))
-        tgt_mg = float(np.mean(target_norm[midgray_idx]))
-        if src_mg > 1e-8:
-            exposure_gain = tgt_mg / src_mg
-            exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
-    source_wb = source_wb * exposure_gain
-    print(f"Exposure-Gain: {exposure_gain:.4f} ({np.log2(exposure_gain):+.2f} EV)")
-    
-    # 2. ROOT-POLYNOMIAL EXPANSION (Finlayson 2015) – without offset
-    r, g, b = source_wb[:, 0:1], source_wb[:, 1:2], source_wb[:, 2:3]
-    source_expanded = np.hstack([r, g, b,
-        np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
-
-    # 3. GEWICHTUNG DER GRAUBLOECKE (duplicate gray patches 10x)
-    gray_indices = {28, 29, 30, 31}
-    extra_s, extra_t = [], []
-    for i in range(len(source_expanded)):
-        if (i % 32) in gray_indices:
-            for _ in range(9):
-                extra_s.append(source_expanded[i])
-                extra_t.append(target_norm[i])
-    if extra_s:
-        source_expanded = np.vstack([source_expanded, np.array(extra_s)])
-        target_norm = np.vstack([target_norm, np.array(extra_t)])
-    
-    # 4. MATRIX KALKULATION (6x3 Root-Polynomial, no offset)
-    matrix, residuals, rank, s = np.linalg.lstsq(source_expanded, target_norm, rcond=None)
-    
-    # Measure accuracy on original (WB-corrected) patches
-    orig_expanded = np.hstack([r, g, b,
-        np.sqrt(np.maximum(r * g, 0)), np.sqrt(np.maximum(r * b, 0)), np.sqrt(np.maximum(g * b, 0))])
-    predicted = np.dot(orig_expanded, matrix)
-    mse = np.mean((target_norm[:len(predicted)] - predicted)**2)
-    print(f"Abweichung (MSE im Linear-Space): {mse:.6f}")
-    
-    print("\nGeneriere die artefaktfreie 65x65 3D-LUT...")
-    lut = colour.LUT3D(size=65, name=lut_name)
-    
-    try:
-        if source_log_curve == "GP-Log2":
-            grid_lin = (np.power(600.0, np.clip(lut.table, 0.0, 1.0)) - 1.0) / 599.0
-        else:
-            grid_lin = colour.models.log_decoding(lut.table, function=source_log_curve)
-    except Exception:
-        grid_lin = np.power(lut.table, 2.4)
-    
-    flat_grid_lin = grid_lin.reshape(-1, 3)
-    
-    # Normalize grid with same black point, apply WB gain then exposure gain
-    flat_grid_norm = np.maximum(flat_grid_lin - src_black, 0.0)
-    flat_grid_wb = flat_grid_norm * wb_gains
-    flat_grid_exposed = flat_grid_wb * exposure_gain
-    gr, gg, gb = flat_grid_exposed[:, 0:1], flat_grid_exposed[:, 1:2], flat_grid_exposed[:, 2:3]
-    flat_grid_expanded = np.hstack([gr, gg, gb,
-        np.sqrt(np.maximum(gr * gg, 0)), np.sqrt(np.maximum(gr * gb, 0)), np.sqrt(np.maximum(gg * gb, 0))])
-    flat_transformed_lin = np.dot(flat_grid_expanded, matrix)
-    flat_transformed_lin = np.maximum(flat_transformed_lin + tgt_black, 1e-6)
-    flat_transformed_lin = np.clip(flat_transformed_lin, 1e-6, 100.0)
-    
-    # ZURUECK IN DEN ZIEL-LOG (z.B. V-Log)
-    try:
-        if target_log_curve == "GP-Log2":
-            lin_clipped = np.clip(flat_transformed_lin, 0.0, None)
-            flat_transformed_log = np.log(lin_clipped * 599.0 + 1.0) / np.log(600.0)
-        else:
-            flat_transformed_log = colour.models.log_encoding(flat_transformed_lin, function=target_log_curve)
-    except Exception:
-        flat_transformed_log = np.power(flat_transformed_lin, 1/2.4)
-        
-    # Absolutes LUT-Clipping
-    flat_transformed_log = np.clip(flat_transformed_log, 0.0, 1.0)
-    
-    lut.table = flat_transformed_log.reshape((65, 65, 65, 3))
-    
     out_filename = get_unique_filename(lut_name)
-    colour.write_LUT(lut, out_filename)
-    
+
+    print("\nBerechne Root-Polynomial Matrix + 65^3 LUT...")
+    try:
+        result = build_lut(
+            all_source_colors, all_target_colors,
+            source_log_curve, target_log_curve,
+            lut_name, out_filename,
+        )
+    except Exception as e:
+        print(f"Fehler bei der LUT-Generierung: {e}")
+        sys.exit(1)
+
+    print(f"Abweichung (MSE im Linear-Space): {result['mse']:.6f}")
+    if result.get('wb_gains'):
+        print(f"WB-Gains: {result['wb_gains'][0]:.4f} {result['wb_gains'][1]:.4f} {result['wb_gains'][2]:.4f}")
+    if result.get('exposure_gain') and result['exposure_gain'] != 1.0:
+        print(f"Exposure-Gain: {result['exposure_gain']:.4f} ({result['exposure_stops']:+.2f} EV)")
+
     print("\n" + "="*50)
     print(f"ERFOLG! Deine LUT wurde gespeichert unter: {out_filename}")
     if not is_master_mode:
