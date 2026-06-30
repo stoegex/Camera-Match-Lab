@@ -1,20 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = []
-hiddenimports += collect_submodules('colour')
 
 
 a = Analysis(
-    ['app/main.py'],
+    ['app\\main.py'],
     pathex=[],
     binaries=[],
     datas=[('app/frontend', 'frontend')],
-    hiddenimports=hiddenimports,
+    hiddenimports=['webview', 'colour', 'cv2'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'pandas', 'scipy', 'IPython', 'PIL', 'tkinter', 'xmlrpc'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
@@ -23,33 +19,21 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='Camera Match Lab',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon.icns'],
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='Camera Match Lab',
-)
-app = BUNDLE(
-    coll,
-    name='Camera Match Lab.app',
-    icon='icon.icns',
-    bundle_identifier='com.cameramatchlab.app',
+    icon=['icon.ico'],
 )

@@ -10,6 +10,7 @@ import os
 import numpy as np
 import cv2
 import colour
+from scipy.interpolate import PchipInterpolator
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +512,7 @@ def warp_image(img_float: np.ndarray, corners: list) -> tuple:
 
 
 def extract_patches(warped_float: np.ndarray, patch_centers_px: list,
-                    roi_size: int = 20, sampling: str = 'trimmed') -> np.ndarray:
+                    roi_size: int = 20, sampling: str = 'mad') -> np.ndarray:
     """
     Average colour inside each patch ROI.
 
@@ -519,6 +520,10 @@ def extract_patches(warped_float: np.ndarray, patch_centers_px: list,
       'mean'    – plain arithmetic mean (fast, but hotpixel-sensitive)
       'trimmed' – 10 % trimmed mean (discards lowest/highest 10 % of pixels
                   per channel; robust against hotpixels and edge CA)
+      'mad'     – Median Absolute Deviation filter (default): only removes
+                  true statistical outliers (>3σ) instead of blindly
+                  discarding a fixed percentage.  Better for dark patches
+                  with asymmetric noise distributions.
       'gaussian'– Gaussian-weighted mean (σ = roi/4, center-weighted;
                   de-emphasizes patch-edge artefacts)
 
@@ -526,6 +531,18 @@ def extract_patches(warped_float: np.ndarray, patch_centers_px: list,
     """
     patch_colors = []
     h, w = warped_float.shape[:2]
+    
+    # Adaptive ROI size based on minimum distance between patches
+    if len(patch_centers_px) > 1:
+        pts = np.array(patch_centers_px, dtype=np.float64)
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=-1)
+        np.fill_diagonal(dist_sq, np.inf)
+        min_dist = np.sqrt(np.min(dist_sq))
+        # 30% of the distance to the nearest patch center is a safe radius
+        adaptive_roi = int(min_dist * 0.30)
+        roi_size = max(5, min(adaptive_roi, min(h, w) // 5))
+
     half = roi_size // 2
 
     for cx, cy in patch_centers_px:
@@ -535,7 +552,20 @@ def extract_patches(warped_float: np.ndarray, patch_centers_px: list,
         cx_max = min(w, cx + half)
         roi = warped_float[cy_min:cy_max, cx_min:cx_max].astype(np.float64)
 
-        if sampling == 'trimmed':
+        if sampling == 'mad':
+            # MAD-based outlier rejection: only removes true statistical
+            # outliers instead of blindly trimming 10% from each tail.
+            flat = roi.reshape(-1, 3)
+            median_val = np.median(flat, axis=0)
+            mad = np.median(np.abs(flat - median_val), axis=0) * 1.4826
+            # Clamp MAD floor so we don't reject everything in uniform patches
+            mad = np.maximum(mad, 1e-6)
+            mask = np.all(np.abs(flat - median_val) < 3.0 * mad, axis=1)
+            if np.sum(mask) >= 4:  # need at least a few pixels
+                avg_color = np.mean(flat[mask], axis=0)
+            else:
+                avg_color = np.mean(flat, axis=0)
+        elif sampling == 'trimmed':
             flat = roi.reshape(-1, 3)
             trim_n = max(1, int(flat.shape[0] * 0.10))
             avg_color = np.mean(np.sort(flat, axis=0)[trim_n:-trim_n], axis=0)
@@ -683,6 +713,27 @@ def _expand_root_polynomial(rgb: np.ndarray, degree: int = 2) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Soft-clipping  (smooth shoulder compression instead of hard clip)
+# ---------------------------------------------------------------------------
+
+def _soft_clip(x: np.ndarray, limit: float = 1.0, knee: float = 0.90) -> np.ndarray:
+    """
+    Smooth roll-off for values above the knee point using tanh compression.
+
+    Values below *knee* pass through unchanged.  Values above *knee* are
+    smoothly compressed towards *limit*, eliminating the hard posterization
+    edges that a plain np.clip(x, 0, 1) would create in saturated LUT
+    regions.  The function is C¹-continuous at the knee.
+    """
+    x = np.asarray(x, dtype=np.float64).copy()
+    above = x > knee
+    headroom = limit - knee
+    if headroom > 0:
+        x[above] = knee + headroom * np.tanh((x[above] - knee) / headroom)
+    return x
+
+
+# ---------------------------------------------------------------------------
 # Display transform helpers  (for reference-match mode)
 # ---------------------------------------------------------------------------
 
@@ -722,29 +773,67 @@ def _prepare_reference_tone_curve(
     target_rgb: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build a monotonic code-value tone curve from the large neutral patches.
+    Build a monotonic code-value tone curve using all patches.
 
-    Reference screenshots already contain their final display rendering. Fitting
-    the measured code values directly preserves the complete source-to-look
-    relationship and prevents unconstrained polynomial fits from producing
-    reversed tones.
+    Reference screenshots already contain their final display rendering.
+    We use the explicit neutral patches as core anchors, but enrich the
+    curve by measuring the median luminance of all color patches across
+    several bins to capture the full contrast curve without being thrown
+    off by specific color grades.
     """
     neutral_indices = _reference_neutral_indices(len(source_rgb))
     if len(neutral_indices) < 4:
         raise ValueError("Reference matching requires a complete 32-patch chart")
 
+    # 1. Base neutral patches
     source_neutral = np.mean(source_rgb[neutral_indices], axis=1)
     target_neutral = target_rgb[neutral_indices]
-    order = np.argsort(source_neutral)
+    
+    # Determine the neutral color balance ratios (R/Y, G/Y, B/Y) along the curve
+    neutral_tgt_luma = np.mean(target_neutral, axis=1)
+    neutral_ratios = target_neutral / np.maximum(neutral_tgt_luma[:, np.newaxis], 1e-6)
+    n_order = np.argsort(neutral_tgt_luma)
+    n_tgt_luma = neutral_tgt_luma[n_order]
+    n_ratios = neutral_ratios[n_order]
 
-    source_knots = np.concatenate(([0.0], source_neutral[order], [1.0]))
-    target_knots = np.vstack((np.zeros(3), target_neutral[order], np.ones(3)))
+    # 2. Enrich with median luma from all patches in bins
+    source_luma = np.mean(source_rgb, axis=1)
+    target_luma = np.mean(target_rgb, axis=1)
+    
+    bins = np.linspace(0.0, 1.0, 11)
+    binned_src = []
+    binned_tgt_rgb = []
+    
+    for i in range(len(bins)-1):
+        mask = (source_luma >= bins[i]) & (source_luma < bins[i+1])
+        if np.sum(mask) >= 2:
+            s_luma = np.median(source_luma[mask])
+            t_luma = np.median(target_luma[mask])
+            # Project this luma back into neutral RGB using interpolated balance
+            t_rgb = np.zeros(3)
+            for c in range(3):
+                ratio_c = np.interp(t_luma, n_tgt_luma, n_ratios[:, c])
+                t_rgb[c] = t_luma * ratio_c
+            binned_src.append(s_luma)
+            binned_tgt_rgb.append(t_rgb)
 
-    # Merge nearly identical source values before interpolation.
+    # 3. Combine both
+    all_src = np.concatenate(([0.0], source_neutral, binned_src, [1.0]))
+    if binned_tgt_rgb:
+        binned_tgt_rgb = np.vstack(binned_tgt_rgb)
+        all_tgt = np.vstack((np.zeros(3), target_neutral, binned_tgt_rgb, np.ones(3)))
+    else:
+        all_tgt = np.vstack((np.zeros(3), target_neutral, np.ones(3)))
+
+    order = np.argsort(all_src)
+    source_knots_raw = all_src[order]
+    target_knots_raw = all_tgt[order]
+
+    # Merge nearly identical source values before interpolation
     unique_source = []
     unique_target = []
-    for value, rgb in zip(source_knots, target_knots):
-        if unique_source and abs(value - unique_source[-1]) < 1e-6:
+    for value, rgb in zip(source_knots_raw, target_knots_raw):
+        if unique_source and abs(value - unique_source[-1]) < 1e-4:
             unique_target[-1] = (unique_target[-1] + rgb) * 0.5
         else:
             unique_source.append(float(value))
@@ -753,7 +842,7 @@ def _prepare_reference_tone_curve(
     source_knots = np.asarray(unique_source, dtype=np.float64)
     target_knots = np.asarray(unique_target, dtype=np.float64)
 
-    # Sampling noise must not make a neutral ramp reverse direction.
+    # Sampling noise must not make a neutral ramp reverse direction
     target_knots = np.maximum.accumulate(target_knots, axis=0)
     target_knots = np.clip(target_knots, 0.0, 1.0)
     return source_knots, target_knots
@@ -764,11 +853,23 @@ def _apply_reference_tone_curve(
     source_knots: np.ndarray,
     target_knots: np.ndarray,
 ) -> np.ndarray:
+    """
+    Apply the neutral-axis tone curve using monotonic PCHIP interpolation.
+
+    PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) produces
+    smoother transitions than linear np.interp, which is critical when
+    only 4-6 knot points define the entire tonal mapping.  The monotonic
+    property is guaranteed by PCHIP, preventing tone reversals.
+    """
     values = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
-    return np.column_stack([
-        np.interp(values, source_knots, target_knots[:, channel])
-        for channel in range(3)
-    ])
+    result = np.empty((len(values), 3), dtype=np.float64)
+    for channel in range(3):
+        spline = PchipInterpolator(source_knots, target_knots[:, channel],
+                                   extrapolate=False)
+        result[:, channel] = np.clip(
+            np.nan_to_num(spline(values), nan=0.0), 0.0, 1.0
+        )
+    return result
 
 
 def _fit_reference_code_value_transform(
@@ -779,8 +880,9 @@ def _fit_reference_code_value_transform(
     Fit a stable source-code to final-display transform.
 
     Luminance is handled by the measured neutral tone curve. A regularized
-    matrix maps only chroma deviations, so it cannot bend or reverse the
-    neutral axis.
+    matrix maps only chroma deviations. By adding Luma-weighted features
+    (Chroma * Luma), the matrix can apply different hue/saturation shifts
+    in the shadows vs highlights (Luminance-dependent Chroma Matrix).
     """
     source_knots, target_knots = _prepare_reference_tone_curve(source_rgb, target_rgb)
     source_luma = np.mean(source_rgb, axis=1)
@@ -788,11 +890,17 @@ def _fit_reference_code_value_transform(
     source_chroma = source_rgb - source_luma[:, np.newaxis]
     target_residual = target_rgb - base_target
 
-    gram = source_chroma.T @ source_chroma
+    # Features: C, C*L  (Preserves neutrals because if C=0, features=0)
+    features = np.hstack([
+        source_chroma,
+        source_chroma * source_luma[:, np.newaxis]
+    ])
+
+    gram = features.T @ features
     ridge = max(float(np.trace(gram)) / 300.0, 1e-8)
     chroma_matrix = np.linalg.solve(
-        gram + ridge * np.eye(3),
-        source_chroma.T @ target_residual,
+        gram + ridge * np.eye(features.shape[1]),
+        features.T @ target_residual,
     )
     return source_knots, target_knots, chroma_matrix
 
@@ -807,7 +915,13 @@ def _apply_reference_code_value_transform(
     luma = np.mean(rgb, axis=1)
     base_target = _apply_reference_tone_curve(luma, source_knots, target_knots)
     chroma = rgb - luma[:, np.newaxis]
-    return np.clip(base_target + chroma @ chroma_matrix, 0.0, 1.0)
+    
+    features = np.hstack([
+        chroma,
+        chroma * luma[:, np.newaxis]
+    ])
+    
+    return np.clip(base_target + features @ chroma_matrix, 0.0, 1.0)
 
 
 # ColorChecker Video: reflectance of the darkest gray patch (#31, index 31)
@@ -968,18 +1082,31 @@ def build_lut(
     # 2. Black-point normalization — patch #31 reflectance extrapolation
     source_n, target_n, src_black, tgt_black = _normalize_black_points(source_lin, target_lin)
 
-    # 3. Auto exposure-gain from mid-gray patch (#30) on perceptually weighted
-    #    luminance BEFORE WB — so WB differences don't leak into exposure.
-    midgray_idx = [i for i in range(len(source_n)) if (i % 32) == 30]
+    # 3. Auto exposure-gain from all 4 neutral patches with perceptual
+    #    luminance weighting.  Using multiple patches instead of a single
+    #    mid-gray (#30) makes the gain robust against per-patch noise and
+    #    slight over/under-exposure of individual swatches.
+    neutral_indices_for_exp = _neutral_patch_indices(len(source_n))
     exposure_gain = 1.0
-    if midgray_idx:
+    if len(neutral_indices_for_exp) >= 4:
         # Luma: BT.601 coefficients, effectively mono-chromatic → WB-independent
         def _luma(rgb):
             return 0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]
-        src_mg = float(np.mean(_luma(source_n[midgray_idx])))
-        tgt_mg = float(np.mean(_luma(target_n[midgray_idx])))
-        if src_mg > 1e-8:
-            exposure_gain = tgt_mg / src_mg
+
+        src_lumas = _luma(source_n[neutral_indices_for_exp])
+        tgt_lumas = _luma(target_n[neutral_indices_for_exp])
+
+        # Weight mid-gray patches higher, extremes (white/black) lower,
+        # because mid-tones are least likely clipped and most informative.
+        # Patch order within each 32-set: #28=white, #29=light, #30=mid, #31=dark
+        per_patch_weights = np.tile([0.15, 0.30, 0.35, 0.20],
+                                    len(neutral_indices_for_exp) // 4)
+        # Only compute gain from patches with non-trivial signal
+        valid = src_lumas > 1e-6
+        if np.any(valid):
+            per_patch_gains = tgt_lumas[valid] / src_lumas[valid]
+            w = per_patch_weights[valid]
+            exposure_gain = float(np.sum(per_patch_gains * w) / np.sum(w))
             exposure_gain = float(np.clip(exposure_gain, 0.25, 4.0))
 
     # 4. White-balance pre-gain — computed from neutral patches
@@ -991,8 +1118,15 @@ def build_lut(
     source_w, target_w = _weight_gray_patches(source_wb, target_n, weight=10)
 
     # 6. Root-polynomial expansion WITHOUT offset (all-ones removed)
+    #    Ridge-regularized solve instead of plain lstsq to prevent
+    #    overfitting when patch count is low or data is near-collinear.
     expanded = _expand_root_polynomial(source_w, degree=_POLY_DEGREE)[:, :-1]
-    M, _, _, _ = np.linalg.lstsq(expanded.astype(np.float64), target_w.astype(np.float64), rcond=None)
+    gram = expanded.astype(np.float64).T @ expanded.astype(np.float64)
+    ridge = max(float(np.trace(gram)) / 300.0, 1e-8)
+    M = np.linalg.solve(
+        gram + ridge * np.eye(gram.shape[0]),
+        expanded.astype(np.float64).T @ target_w.astype(np.float64),
+    )
 
     # 7. Measure accuracy on original (unweighted, WB-corrected) patches
     expanded_src = _expand_root_polynomial(source_wb, degree=_POLY_DEGREE)[:, :-1]
@@ -1013,7 +1147,8 @@ def build_lut(
     grid_transformed = np.clip(grid_transformed, 1e-6, 100.0)
 
     grid_log = _safe_log_encode(grid_transformed, target_log_curve)
-    grid_log = np.clip(grid_log, 0.0, 1.0)
+    grid_log = _soft_clip(grid_log, limit=1.0, knee=0.90)
+    grid_log = np.maximum(grid_log, 0.0)
 
     lut.table = grid_log.reshape((65, 65, 65, 3))
     colour.write_LUT(lut, output_path)
